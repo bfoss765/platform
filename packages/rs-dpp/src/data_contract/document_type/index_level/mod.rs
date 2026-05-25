@@ -7,6 +7,7 @@ use crate::consensus::basic::data_contract::DuplicateIndexError;
 use crate::consensus::basic::BasicError;
 use crate::consensus::ConsensusError;
 use crate::data_contract::document_type::index::IndexCountability;
+use crate::data_contract::document_type::index::TimeRangeTransform;
 use crate::data_contract::document_type::index_level::IndexType::{
     ContestedResourceIndex, NonUniqueIndex, UniqueIndex,
 };
@@ -99,6 +100,14 @@ pub struct IndexLevel {
     sub_index_levels: BTreeMap<String, IndexLevel>,
     /// did an index terminate at this level
     has_index_with_type: Option<IndexLevelTypeInfo>,
+    /// When set, the property reached at this level is a timestamp that is
+    /// bucketed into time ranges (see [`TimeRangeTransform`]). Only ever set
+    /// on a *first-property* node (a direct child of the root), because a
+    /// time-range transform must be its index's leading property. At
+    /// insert/delete/update time the document's timestamp for this property
+    /// is expanded into one key per overlapping range bucket instead of a
+    /// single key. Immutable after contract creation.
+    time_range: Option<TimeRangeTransform>,
     /// unique level identifier
     level_identifier: u64,
 }
@@ -110,6 +119,12 @@ impl IndexLevel {
 
     pub fn sub_levels(&self) -> &BTreeMap<String, IndexLevel> {
         &self.sub_index_levels
+    }
+
+    /// The time-range transform applied to the property reached at this
+    /// level, if any. Only set on first-property nodes.
+    pub fn time_range(&self) -> Option<&TimeRangeTransform> {
+        self.time_range.as_ref()
     }
 
     pub fn has_index_with_type(&self) -> Option<&IndexLevelTypeInfo> {
@@ -213,6 +228,7 @@ impl IndexLevel {
         let mut index_level = IndexLevel {
             sub_index_levels: Default::default(),
             has_index_with_type: None,
+            time_range: None,
             level_identifier: 0,
         };
 
@@ -221,9 +237,9 @@ impl IndexLevel {
         for index_to_borrow in indices {
             let index = index_to_borrow.borrow();
             let mut current_level = &mut index_level;
-            let mut properties_iter = index.properties.iter().peekable();
+            let mut properties_iter = index.properties.iter().enumerate().peekable();
 
-            while let Some(index_part) = properties_iter.next() {
+            while let Some((position, index_part)) = properties_iter.next() {
                 current_level = current_level
                     .sub_index_levels
                     .entry(index_part.name.clone())
@@ -233,8 +249,20 @@ impl IndexLevel {
                             level_identifier: counter,
                             sub_index_levels: Default::default(),
                             has_index_with_type: None,
+                            time_range: None,
                         }
                     });
+
+                // A time-range transform always targets the index's first
+                // property, so record it on that first-property node. Cross-index
+                // consistency (all indices sharing this first property must agree
+                // on the transform) is enforced in `try_from_schema`; here we
+                // simply record the transform for the indices that declare it.
+                if position == 0 {
+                    if let Some(transform) = &index.time_range {
+                        current_level.time_range = Some(transform.clone());
+                    }
+                }
 
                 // The last property
                 if properties_iter.peek().is_none() {
@@ -347,6 +375,20 @@ impl IndexLevel {
             );
         }
 
+        // A time-range transform determines how many index entries each
+        // document produces and under which bucket keys. Changing it after
+        // creation would leave already-stored documents indexed under stale
+        // buckets, so it is immutable — reject any change.
+        if let Some(time_range_change_path) = self.find_first_time_range_change(new_indices) {
+            return SimpleConsensusValidationResult::new_with_error(
+                DataContractInvalidIndexDefinitionUpdateError::new(
+                    document_type_name.to_string(),
+                    time_range_change_path,
+                )
+                .into(),
+            );
+        }
+
         SimpleConsensusValidationResult::new()
     }
 }
@@ -375,6 +417,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -406,6 +449,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![
@@ -422,6 +466,7 @@ mod tests {
                 range_countable: false,
                 summable: None,
                 range_summable: false,
+                time_range: None,
             },
             Index {
                 name: "test2".to_string(),
@@ -436,6 +481,7 @@ mod tests {
                 range_countable: false,
                 summable: None,
                 range_summable: false,
+                time_range: None,
             },
         ];
 
@@ -476,6 +522,7 @@ mod tests {
                 range_countable: false,
                 summable: None,
                 range_summable: false,
+                time_range: None,
             },
             Index {
                 name: "test2".to_string(),
@@ -490,6 +537,7 @@ mod tests {
                 range_countable: false,
                 summable: None,
                 range_summable: false,
+                time_range: None,
             },
         ];
 
@@ -506,6 +554,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -544,6 +593,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -565,6 +615,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -609,6 +660,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -624,6 +676,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -662,6 +715,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -677,6 +731,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -715,6 +770,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -730,6 +786,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -768,6 +825,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -806,6 +864,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -821,6 +880,7 @@ mod tests {
             range_countable: true,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -859,6 +919,7 @@ mod tests {
             range_countable: true,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -874,6 +935,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -918,6 +980,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -939,6 +1002,7 @@ mod tests {
             range_countable: true,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =
@@ -983,6 +1047,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let new_indices = vec![Index {
@@ -1004,6 +1069,7 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }];
 
         let old_index_structure =

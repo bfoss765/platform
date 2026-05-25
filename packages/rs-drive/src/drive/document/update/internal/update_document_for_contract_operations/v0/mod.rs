@@ -31,8 +31,11 @@ use crate::drive::document::paths::{
     contract_documents_keeping_history_primary_key_path_for_document_id,
     contract_documents_primary_key_path,
 };
+use crate::util::object_size_info::DocumentInfo;
 use dpp::data_contract::document_type::methods::DocumentTypeBasicMethods;
-use dpp::data_contract::document_type::{IndexCountability, IndexLevel};
+use dpp::data_contract::document_type::{
+    DocumentPropertyType, DocumentTypeRef, Index, IndexCountability, IndexLevel, TimeRangeTransform,
+};
 use dpp::version::PlatformVersion;
 use grovedb::batch::key_info::KeyInfo;
 use grovedb::batch::key_info::KeyInfo::KnownKey;
@@ -351,6 +354,31 @@ impl Drive {
             } else {
                 document_reference.clone()
             };
+
+            // Time-range indexes store one entry per overlapping range bucket,
+            // so they need a set-diff update rather than the single old→new
+            // value transition below. `current_index_level` is still the
+            // top-level (source) node and `index_path` is the base
+            // (…/<document_type>/<source>) at this point.
+            if let Some(transform) = &index.time_range {
+                self.update_time_range_index_for_contract_operations_v0(
+                    index,
+                    transform,
+                    document,
+                    &old_document_info,
+                    owner_id,
+                    document_type,
+                    &index_path,
+                    current_index_level,
+                    &index_document_reference,
+                    storage_flags,
+                    previous_batch_operations,
+                    &mut batch_operations,
+                    transaction,
+                    platform_version,
+                )?;
+                continue;
+            }
 
             // with the example of the dashpay contract's first index
             // the index path is now something likeDataContracts/ContractID/Documents(1)/$ownerId
@@ -705,5 +733,244 @@ impl Drive {
             }
         }
         Ok(batch_operations)
+    }
+
+    /// Updates the index entries for a single **time-range** index.
+    ///
+    /// A time-range index stores one entry per overlapping range bucket the
+    /// document's timestamp falls into, so an update is a set diff rather than
+    /// the single old→new transition the normal-index path performs:
+    /// - buckets present only in the old timestamp's set are removed,
+    /// - buckets present only in the new timestamp's set are inserted,
+    /// - buckets present in both are refreshed, or (when a later index property
+    ///   changed) deleted under the old sub-values and reinserted under the new
+    ///   ones.
+    ///
+    /// Time-range indexes are validated to be non-unique and non-contested, so
+    /// only the non-unique terminator layout (`…/<value>/[0]/<doc_id>`) is
+    /// handled here. The estimated-cost / document-size update path never
+    /// reaches this method — it delegates to the insert path, which has its own
+    /// bucket fan-out.
+    #[allow(clippy::too_many_arguments)]
+    fn update_time_range_index_for_contract_operations_v0(
+        &self,
+        index: &Index,
+        transform: &TimeRangeTransform,
+        document: &Document,
+        old_document_info: &DocumentInfo,
+        owner_id: Option<[u8; 32]>,
+        document_type: DocumentTypeRef,
+        base_index_path: &[Vec<u8>],
+        top_index_level: &IndexLevel,
+        index_document_reference: &Element,
+        storage_flags: Option<&StorageFlags>,
+        previous_batch_operations: &mut Option<&mut Vec<LowLevelDriveOperation>>,
+        batch_operations: &mut Vec<LowLevelDriveOperation>,
+        transaction: TransactionArg,
+        platform_version: &PlatformVersion,
+    ) -> Result<(), Error> {
+        let drive_version = &platform_version.drive;
+
+        // New/old timestamps for the bucketed source property → bucket key sets.
+        let new_ts = document
+            .get_raw_for_document_type(
+                &transform.source,
+                document_type,
+                owner_id,
+                platform_version,
+            )?
+            .and_then(|bytes| DocumentPropertyType::decode_date_timestamp(&bytes));
+        let old_ts = match old_document_info.get_raw_for_document_type(
+            &transform.source,
+            document_type,
+            None,
+            None,
+            platform_version,
+        )? {
+            Some(DriveKeyInfo::Key(k)) => DocumentPropertyType::decode_date_timestamp(&k),
+            Some(DriveKeyInfo::KeyRef(k)) => DocumentPropertyType::decode_date_timestamp(k),
+            _ => None,
+        };
+
+        let encode_buckets = |ts: Option<u64>| -> Vec<Vec<u8>> {
+            ts.map(|t| {
+                transform
+                    .containing_buckets(t)
+                    .into_iter()
+                    .map(DocumentPropertyType::encode_date_timestamp)
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        let new_buckets = encode_buckets(new_ts);
+        let old_buckets = encode_buckets(old_ts);
+
+        // Sub-property suffix (positions 1..) interleaved as [name, value, …]
+        // for both the new and old document, plus the IndexLevel node at each
+        // depth (for the matching tree variant on insert).
+        let mut levels: Vec<&IndexLevel> = Vec::new();
+        let mut new_suffix: Vec<Vec<u8>> = Vec::new();
+        let mut old_suffix: Vec<Vec<u8>> = Vec::new();
+        let mut current_level = top_index_level;
+        for index_property in index.properties.iter().skip(1) {
+            current_level =
+                current_level
+                    .sub_levels()
+                    .get(&index_property.name)
+                    .ok_or(Error::Drive(DriveError::CorruptedContractIndexes(format!(
+                        "index structure missing sub_level '{}' under time-range index '{}'",
+                        index_property.name, index.name
+                    ))))?;
+            levels.push(current_level);
+
+            let new_val = document
+                .get_raw_for_document_type(
+                    &index_property.name,
+                    document_type,
+                    owner_id,
+                    platform_version,
+                )?
+                .unwrap_or_default();
+            let old_val = match old_document_info.get_raw_for_document_type(
+                &index_property.name,
+                document_type,
+                None,
+                None,
+                platform_version,
+            )? {
+                Some(DriveKeyInfo::Key(k)) => k,
+                Some(DriveKeyInfo::KeyRef(k)) => k.to_vec(),
+                _ => Vec::new(),
+            };
+            new_suffix.push(index_property.name.as_bytes().to_vec());
+            new_suffix.push(new_val);
+            old_suffix.push(index_property.name.as_bytes().to_vec());
+            old_suffix.push(old_val);
+        }
+
+        let suffix_changed = new_suffix != old_suffix;
+        let reference_tree_type =
+            reference_tree_type_for_index(index.countable, &index.summable, index.range_summable);
+        let top_value_tree_type = value_tree_type_for_index_level(top_index_level);
+        let doc_id = document.id();
+
+        let new_set: HashSet<&Vec<u8>> = new_buckets.iter().collect();
+        let old_set: HashSet<&Vec<u8>> = old_buckets.iter().collect();
+
+        // Delete old entries: removed buckets, plus common buckets whose
+        // sub-values changed (their old-suffix path no longer matches).
+        for bucket in &old_buckets {
+            if new_set.contains(bucket) && !suffix_changed {
+                continue; // unchanged entry — refreshed below
+            }
+            let mut key_info_path: Vec<KeyInfo> = base_index_path
+                .iter()
+                .map(|s| KnownKey(s.clone()))
+                .collect();
+            key_info_path.push(KnownKey(bucket.clone()));
+            for segment in &old_suffix {
+                key_info_path.push(KnownKey(segment.clone()));
+            }
+            key_info_path.push(KnownKey(vec![0]));
+            self.batch_delete_up_tree_while_empty(
+                KeyInfoPath::from_vec(key_info_path),
+                doc_id.as_slice(),
+                Some(CONTRACT_DOCUMENTS_PATH_HEIGHT),
+                BatchDeleteUpTreeApplyType::StatefulBatchDelete {
+                    is_known_to_be_subtree_with_sum: Some(MaybeTree::NotTree),
+                },
+                transaction,
+                previous_batch_operations,
+                batch_operations,
+                drive_version,
+            )?;
+        }
+
+        // Insert/refresh new entries: added buckets are inserted; common
+        // buckets are refreshed when unchanged or reinserted when the suffix
+        // changed.
+        for bucket in &new_buckets {
+            if old_set.contains(bucket) && !suffix_changed {
+                // Unchanged entry — refresh the stored reference in place
+                // (its content can still differ via storage flags).
+                let mut path: Vec<Vec<u8>> = base_index_path.to_vec();
+                path.push(bucket.clone());
+                for segment in &new_suffix {
+                    path.push(segment.clone());
+                }
+                path.push(vec![0]);
+                self.batch_refresh_reference(
+                    path,
+                    doc_id.to_vec(),
+                    index_document_reference.clone(),
+                    storage_flags.is_none(),
+                    batch_operations,
+                    drive_version,
+                )?;
+                continue;
+            }
+
+            // Materialize every tree along the entry path (mirrors the insert
+            // path's tree-variant dispatch), then store the reference.
+            let mut path: Vec<Vec<u8>> = base_index_path.to_vec();
+            self.batch_insert_empty_tree_if_not_exists(
+                PathKeyInfo::PathKeyRef::<0>((path.clone(), bucket.as_slice())),
+                top_value_tree_type,
+                storage_flags,
+                BatchInsertTreeApplyType::StatefulBatchInsertTree,
+                transaction,
+                previous_batch_operations,
+                batch_operations,
+                drive_version,
+            )?;
+            path.push(bucket.clone());
+
+            for (i, level) in levels.iter().enumerate() {
+                let property_name = &new_suffix[i * 2];
+                let value = &new_suffix[i * 2 + 1];
+                self.batch_insert_empty_tree_if_not_exists(
+                    PathKeyInfo::PathKeyRef::<0>((path.clone(), property_name.as_slice())),
+                    property_name_tree_type_for_index_level(level),
+                    storage_flags,
+                    BatchInsertTreeApplyType::StatefulBatchInsertTree,
+                    transaction,
+                    previous_batch_operations,
+                    batch_operations,
+                    drive_version,
+                )?;
+                path.push(property_name.clone());
+                self.batch_insert_empty_tree_if_not_exists(
+                    PathKeyInfo::PathKeyRef::<0>((path.clone(), value.as_slice())),
+                    value_tree_type_for_index_level(level),
+                    storage_flags,
+                    BatchInsertTreeApplyType::StatefulBatchInsertTree,
+                    transaction,
+                    previous_batch_operations,
+                    batch_operations,
+                    drive_version,
+                )?;
+                path.push(value.clone());
+            }
+
+            self.batch_insert_empty_tree_if_not_exists(
+                PathKeyInfo::PathKeyRef::<0>((path.clone(), &[0])),
+                reference_tree_type,
+                storage_flags,
+                BatchInsertTreeApplyType::StatefulBatchInsertTree,
+                transaction,
+                previous_batch_operations,
+                batch_operations,
+                drive_version,
+            )?;
+            path.push(vec![0]);
+
+            self.batch_insert(
+                PathKeyRefElement::<0>((path, doc_id.as_slice(), index_document_reference.clone())),
+                batch_operations,
+                drive_version,
+            )?;
+        }
+
+        Ok(())
     }
 }

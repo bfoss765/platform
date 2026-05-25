@@ -2054,6 +2054,7 @@ mod range_countable_picker_tests {
             // tree-shape resolver (see `primary_key_tree_type.rs`).
             summable: None,
             range_summable: false,
+            time_range: None,
         }
     }
 

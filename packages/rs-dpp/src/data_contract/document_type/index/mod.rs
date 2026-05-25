@@ -30,6 +30,9 @@ use std::sync::OnceLock;
 use std::{collections::BTreeMap, convert::TryFrom};
 
 pub mod random_index;
+pub mod time_range;
+
+pub use time_range::TimeRangeTransform;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -416,6 +419,14 @@ pub struct Index {
     /// `packages/rs-drive/src/drive/document/primary_key_tree_type.rs`
     /// picks the appropriate variant.
     pub range_summable: bool,
+    /// When set, the index's first property is a timestamp that is bucketed
+    /// into fixed-length, regularly-spaced (possibly overlapping) time
+    /// ranges. The stored key for that property is the range *start* (a
+    /// `u64` millisecond timestamp), and a single document is indexed under
+    /// every range whose window contains its timestamp. See
+    /// [`TimeRangeTransform`]. The named source must be this index's first
+    /// property. Available from protocol version 12.
+    pub time_range: Option<TimeRangeTransform>,
 }
 
 impl Index {
@@ -621,6 +632,7 @@ impl TryFrom<&[(Value, Value)]> for Index {
         // alongside `summable: "y"`) before the merge.
         let mut averageable: Option<String> = None;
         let mut range_averageable = false;
+        let mut time_range: Option<TimeRangeTransform> = None;
 
         for (key_value, value_value) in index_type_value_map {
             let key = key_value.to_str()?;
@@ -846,6 +858,85 @@ impl TryFrom<&[(Value, Value)]> for Index {
                                 "rangeAverageable value must be a boolean".to_string(),
                             ))?;
                 }
+                "timeRange" => {
+                    let time_range_map =
+                        value_value
+                            .as_map()
+                            .ok_or(DataContractError::ValueWrongType(
+                                "timeRange value should be a map".to_string(),
+                            ))?;
+
+                    let mut source: Option<String> = None;
+                    let mut range_ms: Option<u64> = None;
+                    let mut step_ms: Option<u64> = None;
+                    let mut origin_ms: u64 = 0;
+
+                    for (tr_key_value, tr_value) in time_range_map {
+                        let tr_key = tr_key_value
+                            .to_str()
+                            .map_err(|e| DataContractError::ValueDecodingError(e.to_string()))?;
+                        match tr_key {
+                            "on" => {
+                                source = Some(
+                                    tr_value
+                                        .as_text()
+                                        .ok_or(DataContractError::ValueWrongType(
+                                            "timeRange.on should be a string".to_string(),
+                                        ))?
+                                        .to_owned(),
+                                );
+                            }
+                            "range" => {
+                                range_ms = Some(tr_value.to_integer().map_err(|_| {
+                                    DataContractError::ValueWrongType(
+                                        "timeRange.range should be an integer".to_string(),
+                                    )
+                                })?);
+                            }
+                            "step" => {
+                                step_ms = Some(tr_value.to_integer().map_err(|_| {
+                                    DataContractError::ValueWrongType(
+                                        "timeRange.step should be an integer".to_string(),
+                                    )
+                                })?);
+                            }
+                            "origin" => {
+                                origin_ms = tr_value.to_integer().map_err(|_| {
+                                    DataContractError::ValueWrongType(
+                                        "timeRange.origin should be an integer".to_string(),
+                                    )
+                                })?;
+                            }
+                            other => {
+                                return Err(DataContractError::InvalidContractStructure(format!(
+                                    "unexpected timeRange field: {}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+
+                    let source = source.ok_or(DataContractError::InvalidContractStructure(
+                        "timeRange requires an `on` field naming the source timestamp property"
+                            .to_string(),
+                    ))?;
+                    let range_ms = range_ms.ok_or(DataContractError::InvalidContractStructure(
+                        "timeRange requires a `range` field (range length in milliseconds)"
+                            .to_string(),
+                    ))?;
+                    let step_ms = step_ms.ok_or(DataContractError::InvalidContractStructure(
+                        "timeRange requires a `step` field (interval between range starts in \
+                         milliseconds)"
+                            .to_string(),
+                    ))?;
+
+                    time_range = Some(TimeRangeTransform {
+                        source,
+                        range_ms,
+                        step_ms,
+                        origin_ms,
+                    });
+                }
                 "properties" => {
                     let properties =
                         value_value
@@ -995,6 +1086,71 @@ impl TryFrom<&[(Value, Value)]> for Index {
             ));
         }
 
+        // A time-range transform buckets the index's *first* property. Validate
+        // the structural constraints that don't need document-type context here
+        // (the source must be a timestamp/Date field — which does need the
+        // schema — is checked in `try_from_schema`).
+        if let Some(transform) = &time_range {
+            // Overlapping ranges index a single document under several bucket
+            // keys, which is fundamentally incompatible with uniqueness and
+            // with contested resources. Reject both up front.
+            if unique {
+                return Err(DataContractError::InvalidContractStructure(
+                    "a timeRange index cannot be unique: overlapping ranges index one document \
+                     under several bucket keys"
+                        .to_string(),
+                ));
+            }
+            if contested_index.is_some() {
+                return Err(DataContractError::InvalidContractStructure(
+                    "a timeRange index cannot be a contested resource".to_string(),
+                ));
+            }
+            if transform.step_ms == 0 {
+                return Err(DataContractError::InvalidContractStructure(
+                    "timeRange.step must be greater than zero".to_string(),
+                ));
+            }
+            if transform.range_ms == 0 {
+                return Err(DataContractError::InvalidContractStructure(
+                    "timeRange.range must be greater than zero".to_string(),
+                ));
+            }
+            if transform.range_ms % transform.step_ms != 0 {
+                return Err(DataContractError::InvalidContractStructure(
+                    "timeRange.range must be an exact multiple of timeRange.step so the number \
+                     of overlapping ranges per document is deterministic"
+                        .to_string(),
+                ));
+            }
+            let overlap = transform.range_ms / transform.step_ms;
+            if overlap > time_range::MAX_TIME_RANGE_OVERLAP_FACTOR {
+                return Err(DataContractError::InvalidContractStructure(format!(
+                    "timeRange overlap factor (range / step = {}) exceeds the maximum of {}; \
+                     a smaller window or larger step is required to bound per-document index \
+                     entries",
+                    overlap,
+                    time_range::MAX_TIME_RANGE_OVERLAP_FACTOR
+                )));
+            }
+            match index_properties.first() {
+                Some(first) if first.name == transform.source => {}
+                Some(first) => {
+                    return Err(DataContractError::InvalidContractStructure(format!(
+                        "timeRange.on (\"{}\") must name the first index property (\"{}\"); a \
+                         time range partitions the index by time, so it has to be the leading \
+                         property",
+                        transform.source, first.name
+                    )));
+                }
+                None => {
+                    return Err(DataContractError::InvalidContractStructure(
+                        "an index with a timeRange must have at least one property".to_string(),
+                    ));
+                }
+            }
+        }
+
         // if the index didn't have a name let's make one
         let name = name.unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::thread_rng(), 24));
 
@@ -1008,6 +1164,7 @@ impl TryFrom<&[(Value, Value)]> for Index {
             range_countable,
             summable,
             range_summable,
+            time_range,
         })
     }
 }
@@ -1065,7 +1222,104 @@ mod tests {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // timeRange parsing + structural validation tests
+    // -----------------------------------------------------------------------
+
+    fn index_value_map(
+        first_property: &str,
+        time_range: Option<(&str, u64, u64)>,
+    ) -> Vec<(Value, Value)> {
+        let property = Value::Map(vec![(
+            Value::Text(first_property.to_string()),
+            Value::Text("asc".to_string()),
+        )]);
+        let hashtag = Value::Map(vec![(
+            Value::Text("hashtag".to_string()),
+            Value::Text("asc".to_string()),
+        )]);
+
+        let mut map = vec![
+            (
+                Value::Text("name".to_string()),
+                Value::Text("trending".to_string()),
+            ),
+            (
+                Value::Text("properties".to_string()),
+                Value::Array(vec![property, hashtag]),
+            ),
+        ];
+
+        if let Some((on, range, step)) = time_range {
+            map.push((
+                Value::Text("timeRange".to_string()),
+                Value::Map(vec![
+                    (Value::Text("on".to_string()), Value::Text(on.to_string())),
+                    (Value::Text("range".to_string()), Value::U64(range)),
+                    (Value::Text("step".to_string()), Value::U64(step)),
+                ]),
+            ));
+        }
+
+        map
+    }
+
+    #[test]
+    fn time_range_index_parses() {
+        let map = index_value_map("$createdAt", Some(("$createdAt", 21_600_000, 7_200_000)));
+        let index = Index::try_from(map.as_slice()).expect("should parse");
+        let transform = index.time_range.expect("time_range should be set");
+        assert_eq!(transform.source, "$createdAt");
+        assert_eq!(transform.range_ms, 21_600_000);
+        assert_eq!(transform.step_ms, 7_200_000);
+        assert_eq!(transform.origin_ms, 0);
+        assert_eq!(transform.overlap_factor(), 3);
+    }
+
+    #[test]
+    fn time_range_rejects_non_multiple_range() {
+        let map = index_value_map("$createdAt", Some(("$createdAt", 21_600_000, 7_000_000)));
+        let err = Index::try_from(map.as_slice()).unwrap_err();
+        assert!(matches!(
+            err,
+            DataContractError::InvalidContractStructure(_)
+        ));
+    }
+
+    #[test]
+    fn time_range_rejects_overlap_over_cap() {
+        // overlap factor = 300 > 256
+        let map = index_value_map("$createdAt", Some(("$createdAt", 300, 1)));
+        let err = Index::try_from(map.as_slice()).unwrap_err();
+        assert!(matches!(
+            err,
+            DataContractError::InvalidContractStructure(_)
+        ));
+    }
+
+    #[test]
+    fn time_range_rejects_source_not_first_property() {
+        // `on` names a property that is not the first index property
+        let map = index_value_map("$createdAt", Some(("hashtag", 60, 20)));
+        let err = Index::try_from(map.as_slice()).unwrap_err();
+        assert!(matches!(
+            err,
+            DataContractError::InvalidContractStructure(_)
+        ));
+    }
+
+    #[test]
+    fn time_range_rejects_zero_step() {
+        let map = index_value_map("$createdAt", Some(("$createdAt", 60, 0)));
+        let err = Index::try_from(map.as_slice()).unwrap_err();
+        assert!(matches!(
+            err,
+            DataContractError::InvalidContractStructure(_)
+        ));
     }
 
     // -----------------------------------------------------------------------

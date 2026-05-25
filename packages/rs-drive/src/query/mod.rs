@@ -511,6 +511,65 @@ impl From<InternalClauses> for Vec<WhereClause> {
     }
 }
 
+/// Which active time range a `TOP(timeRange(...))` selection resolves to,
+/// when the index's ranges overlap (`range > step`). Time-range queries are a
+/// v1-only feature; the v0 query surface is unaffected.
+#[cfg(any(feature = "server", feature = "verify"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TimeRangeSelector {
+    /// The freshest started range (largest start ≤ now). Covers the latest
+    /// partial slice (0..step of history).
+    Newest,
+    /// The oldest range still active at now. Covers a near-full trailing
+    /// window of ~range of history. Best for "trending over the last window".
+    Oldest,
+}
+
+/// Resolves a time-range selection on `field` into a concrete equality
+/// [`WhereClause`] on the bucketed source field, using the index's
+/// `timeRange` transform and an authoritative `block_time_ms`.
+///
+/// The server supplies `block_time_ms` from current block time and the
+/// verifier re-derives it from the quorum-signed response metadata `time_ms`,
+/// so both produce the identical concrete equality query — the existing
+/// index/count proofs apply unchanged and the engine never needs a dedicated
+/// time-range operator.
+#[cfg(any(feature = "server", feature = "verify"))]
+pub fn resolve_time_range_bucket_clause(
+    field: &str,
+    selector: TimeRangeSelector,
+    document_type: DocumentTypeRef,
+    block_time_ms: u64,
+) -> Result<WhereClause, Error> {
+    let transform = document_type
+        .indexes()
+        .values()
+        .find_map(|index| {
+            index
+                .time_range
+                .as_ref()
+                .filter(|transform| transform.source == field)
+        })
+        .ok_or(Error::Query(
+            QuerySyntaxError::WhereClauseOnNonIndexedProperty(format!(
+                "no time-range index is defined on field \"{}\"",
+                field
+            )),
+        ))?;
+
+    let bucket_start = match selector {
+        TimeRangeSelector::Newest => transform.newest_active_start(block_time_ms),
+        TimeRangeSelector::Oldest => transform.oldest_active_start(block_time_ms),
+    };
+
+    Ok(WhereClause {
+        field: field.to_string(),
+        operator: WhereOperator::Equal,
+        value: Value::U64(bucket_start),
+    })
+}
+
 #[cfg(any(feature = "server", feature = "verify"))]
 /// Drive query struct
 #[derive(Debug, PartialEq, Clone)]

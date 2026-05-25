@@ -465,6 +465,35 @@
           "rangeAverageable": {
             "type": "boolean",
             "description": "Syntactic sugar: `rangeAverageable: true` is shorthand for `rangeCountable: true` + `rangeSummable: true`. Requires `averageable` to be set."
+          },
+          "timeRange": {
+            "type": "object",
+            "properties": {
+              "on": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Name of the timestamp index property to bucket. Must be this index's first property and refer to a millisecond-timestamp field ($createdAt / $updatedAt / $transferredAt or a Date property)."
+              },
+              "range": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Length of each time range window, in milliseconds. Must be an exact multiple of `step`."
+              },
+              "step": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Interval between successive range starts, in milliseconds. When `range` > `step` the ranges overlap and a document is indexed under `range / step` bucket-start values (capped at 256)."
+              },
+              "origin": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Reference origin for range alignment, in milliseconds. Range starts are `origin + k * step`. Defaults to 0."
+              }
+            },
+            "required": ["on", "range", "step"],
+            "additionalProperties": false,
+            "description": "Buckets the first index property's timestamp into fixed-length, regularly-spaced (possibly overlapping) time ranges. The stored key is the range start (a u64 ms). Enables trending/leaderboard queries via TOP(timeRange(...)). Available from protocol version 12."
           }
         },
         "required": [

@@ -42,6 +42,7 @@ fn summable_index(name: &str, props: &[&str], summable: Option<&str>) -> Index {
         range_countable: false,
         summable: summable.map(String::from),
         range_summable: false,
+        time_range: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn range_summable_index(name: &str, props: &[&str], summable: &str) -> Index {
         range_countable: false,
         summable: Some(summable.to_string()),
         range_summable: true,
+        time_range: None,
     }
 }
 

@@ -64,6 +64,7 @@ impl Index {
             range_countable: false,
             summable: None,
             range_summable: false,
+            time_range: None,
         })
     }
 }

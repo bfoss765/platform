@@ -35,6 +35,7 @@ use crate::error::query::QueryError;
 use crate::error::Error;
 use crate::platform_types::platform::Platform;
 use crate::platform_types::platform_state::PlatformState;
+use crate::platform_types::platform_state::PlatformStateV0Methods;
 use crate::query::response_metadata::CheckpointUsed;
 use crate::query::QueryValidationResult;
 use dapi_grpc::platform::v0::get_documents_request::get_documents_request_v0::Start as RequestV0Start;
@@ -464,10 +465,75 @@ impl<C> Platform<C> {
         // wire-malformed HAVING (bad discriminant, missing
         // aggregate, …) starts surfacing as `InvalidArgument`
         // automatically.
-        let where_clauses = match conversions::where_clauses_from_proto(proto_where_clauses) {
+        // Partition out time-range (IN_TIME_RANGE) clauses. They are resolved
+        // to concrete equality clauses on the bucketed source field using the
+        // authoritative committed block time, so the rest of the v1 pipeline
+        // (routing, executors, proofs) treats them as ordinary equality
+        // lookups. The verifier re-derives the same bucket from the
+        // quorum-signed response metadata time, so the proof matches.
+        let (time_range_proto, normal_proto): (Vec<_>, Vec<_>) = proto_where_clauses
+            .into_iter()
+            .partition(conversions::is_time_range_clause);
+
+        let mut where_clauses = match conversions::where_clauses_from_proto(normal_proto) {
             Ok(c) => c,
             Err(e) => return Ok(QueryValidationResult::new_with_error(e)),
         };
+
+        if !time_range_proto.is_empty() {
+            let block_time_ms =
+                match platform_state.last_committed_block_time_ms() {
+                    Some(t) => t,
+                    None => return Ok(QueryValidationResult::new_with_error(QueryError::Query(
+                        QuerySyntaxError::Unsupported(
+                            "a time range (IN_TIME_RANGE) query requires a committed block time"
+                                .to_string(),
+                        ),
+                    ))),
+                };
+            let contract_id: Identifier = check_validation_result_with_data!(data_contract_id
+                .clone()
+                .try_into()
+                .map_err(|_| QueryError::InvalidArgument(
+                    "id must be a valid identifier (32 bytes long)".to_string()
+                )));
+            let (_, contract_fetch_info) = self.drive.get_contract_with_fetch_info_and_fee(
+                contract_id.to_buffer(),
+                None,
+                true,
+                None,
+                platform_version,
+            )?;
+            let contract_fetch_info = check_validation_result_with_data!(contract_fetch_info
+                .ok_or(QueryError::Query(QuerySyntaxError::DataContractNotFound(
+                    "contract not found when resolving a time range query",
+                ))));
+            let contract_ref = &contract_fetch_info.contract;
+            let doc_type = check_validation_result_with_data!(contract_ref
+                .document_type_for_name(document_type.as_str())
+                .map_err(|_| QueryError::InvalidArgument(format!(
+                    "document type {} not found for contract {}",
+                    document_type, contract_id
+                ))));
+            for proto_wc in time_range_proto {
+                let (field, selector) = match conversions::time_range_clause_from_proto(proto_wc) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return Ok(QueryValidationResult::new_with_error(e)),
+                };
+                match drive::query::resolve_time_range_bucket_clause(
+                    &field,
+                    selector,
+                    doc_type,
+                    block_time_ms,
+                ) {
+                    Ok(resolved) => where_clauses.push(resolved),
+                    Err(drive::error::Error::Query(qe)) => {
+                        return Ok(QueryValidationResult::new_with_error(QueryError::Query(qe)))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         let order_by_clauses = match conversions::order_clauses_from_proto(proto_order_by) {
             Ok(c) => c,
             Err(e) => return Ok(QueryValidationResult::new_with_error(e)),

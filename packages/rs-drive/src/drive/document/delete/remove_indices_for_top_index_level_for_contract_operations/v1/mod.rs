@@ -12,7 +12,9 @@ use crate::drive::document::unique_event_id;
 use crate::util::type_constants::DEFAULT_HASH_SIZE_U8;
 
 use crate::drive::Drive;
-use crate::util::object_size_info::{DocumentAndContractInfo, DocumentInfoV0Methods, PathInfo};
+use crate::util::object_size_info::{
+    DocumentAndContractInfo, DocumentInfoV0Methods, DriveKeyInfo, PathInfo,
+};
 
 use crate::error::fee::FeeError;
 use crate::error::Error;
@@ -21,6 +23,7 @@ use crate::fees::op::LowLevelDriveOperation;
 use dpp::data_contract::accessors::v0::DataContractV0Getters;
 use dpp::data_contract::config::v0::DataContractConfigGettersV0;
 use dpp::data_contract::document_type::accessors::DocumentTypeV0Getters;
+use dpp::data_contract::document_type::DocumentPropertyType;
 
 use crate::drive::document::paths::contract_document_type_path_vec;
 use dpp::version::PlatformVersion;
@@ -187,36 +190,72 @@ impl Drive {
             let any_fields_null = document_top_field.is_empty();
             let all_fields_null = document_top_field.is_empty();
 
-            let mut index_path_info = if document_and_contract_info
-                .owned_document_info
-                .document_info
-                .is_document_size()
-            {
-                // This is a stateless operation
-                PathInfo::PathWithSizes(KeyInfoPath::from_known_owned_path(index_path))
-            } else {
-                PathInfo::PathAsVec::<0>(index_path)
+            // Mirror the insert side's time-range fan-out: a time-range
+            // first-property node removes one index entry per overlapping
+            // range bucket the document's timestamp fell into. The buckets are
+            // recomputed deterministically from the document's stored
+            // timestamp, so they match exactly what insert wrote.
+            let index_keys: Vec<DriveKeyInfo> = match sub_level.time_range() {
+                Some(transform) if !document_top_field.is_empty() => match &document_top_field {
+                    DriveKeyInfo::KeySize(_) => {
+                        let overlap = transform.overlap_factor().max(1) as usize;
+                        vec![document_top_field.clone(); overlap]
+                    }
+                    other => {
+                        let raw = match other {
+                            DriveKeyInfo::Key(k) => k.as_slice(),
+                            DriveKeyInfo::KeyRef(k) => *k,
+                            DriveKeyInfo::KeySize(_) => unreachable!(),
+                        };
+                        match DocumentPropertyType::decode_date_timestamp(raw) {
+                            Some(timestamp) => transform
+                                .containing_buckets(timestamp)
+                                .into_iter()
+                                .map(|start| {
+                                    DriveKeyInfo::Key(DocumentPropertyType::encode_date_timestamp(
+                                        start,
+                                    ))
+                                })
+                                .collect(),
+                            None => vec![document_top_field.clone()],
+                        }
+                    }
+                },
+                _ => vec![document_top_field],
             };
 
-            // we push the actual value of the index path
-            index_path_info.push(document_top_field)?;
-            // the index path is now something likeDataContracts/ContractID/Documents(1)/$ownerId/<ownerId>
+            for index_key in index_keys {
+                let mut index_path_info = if document_and_contract_info
+                    .owned_document_info
+                    .document_info
+                    .is_document_size()
+                {
+                    // This is a stateless operation
+                    PathInfo::PathWithSizes(KeyInfoPath::from_known_owned_path(index_path.clone()))
+                } else {
+                    PathInfo::PathAsVec::<0>(index_path.clone())
+                };
 
-            self.remove_indices_for_index_level_for_contract_operations(
-                document_and_contract_info,
-                index_path_info,
-                sub_level,
-                any_fields_null,
-                all_fields_null,
-                value_tree_type,
-                &storage_flags,
-                previous_batch_operations,
-                estimated_costs_only_with_layer_info,
-                event_id,
-                transaction,
-                batch_operations,
-                platform_version,
-            )?;
+                // we push the actual value of the index path
+                index_path_info.push(index_key)?;
+                // the index path is now something likeDataContracts/ContractID/Documents(1)/$ownerId/<ownerId>
+
+                self.remove_indices_for_index_level_for_contract_operations(
+                    document_and_contract_info,
+                    index_path_info,
+                    sub_level,
+                    any_fields_null,
+                    all_fields_null,
+                    value_tree_type,
+                    &storage_flags,
+                    previous_batch_operations,
+                    estimated_costs_only_with_layer_info,
+                    event_id,
+                    transaction,
+                    batch_operations,
+                    platform_version,
+                )?;
+            }
         }
         Ok(())
     }

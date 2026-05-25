@@ -7,6 +7,8 @@ use crate::consensus::basic::data_contract::{
 #[cfg(feature = "validation")]
 use crate::consensus::ConsensusError;
 use crate::data_contract::document_type::index::Index;
+#[cfg(feature = "validation")]
+use crate::data_contract::document_type::index::TimeRangeTransform;
 use crate::data_contract::document_type::index_level::IndexLevel;
 use crate::data_contract::document_type::property::DocumentProperty;
 #[cfg(feature = "validation")]
@@ -374,6 +376,67 @@ impl DocumentTypeV1 {
                                 )));
                             }
 
+                            // `timeRange` indexes bucket a timestamp into
+                            // fixed-length ranges; they rely on the time-range
+                            // query operand and the multi-entry index insertion
+                            // path that only exist from protocol v12 onward.
+                            if index.time_range.is_some() && platform_version.protocol_version < 12
+                            {
+                                return Err(ProtocolError::ConsensusError(Box::new(
+                                    UnsupportedFeatureError::new(
+                                        "time range index".to_string(),
+                                        platform_version.protocol_version,
+                                    )
+                                    .into(),
+                                )));
+                            }
+
+                            // The time-range source must be a millisecond
+                            // timestamp: a system timestamp ($createdAt /
+                            // $updatedAt / $transferredAt) or a user `Date`
+                            // property. Structural checks (first-property,
+                            // range % step, overlap cap) already happened in
+                            // `Index` parsing.
+                            if let Some(transform) = &index.time_range {
+                                let source = transform.source.as_str();
+                                let is_system_timestamp = matches!(
+                                    source,
+                                    property_names::CREATED_AT
+                                        | property_names::UPDATED_AT
+                                        | property_names::TRANSFERRED_AT
+                                );
+                                if !is_system_timestamp {
+                                    match flattened_document_properties.get(source) {
+                                        Some(def)
+                                            if matches!(
+                                                def.property_type,
+                                                DocumentPropertyType::Date
+                                            ) => {}
+                                        Some(def) => {
+                                            return Err(ProtocolError::ConsensusError(Box::new(
+                                                InvalidIndexPropertyTypeError::new(
+                                                    name.to_owned(),
+                                                    index.name.to_owned(),
+                                                    source.to_owned(),
+                                                    def.property_type.name(),
+                                                )
+                                                .into(),
+                                            )));
+                                        }
+                                        None => {
+                                            return Err(ProtocolError::ConsensusError(Box::new(
+                                                UndefinedIndexPropertyError::new(
+                                                    name.to_owned(),
+                                                    index.name.to_owned(),
+                                                    source.to_owned(),
+                                                )
+                                                .into(),
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+
                             validation_operations.extend(std::iter::once(
                                 ProtocolValidationOperation::DocumentTypeSchemaIndexValidation(
                                     index.properties.len() as u64,
@@ -589,6 +652,39 @@ impl DocumentTypeV1 {
             })
             .transpose()?
             .unwrap_or_default();
+
+        // All indices that share a first property must agree on its time-range
+        // transform: either every such index buckets it with the identical
+        // transform, or none do. Otherwise the merged index trie node for that
+        // first property would be ambiguous (bucketed for one index, plain for
+        // another), so we reject the contract up front.
+        #[cfg(feature = "validation")]
+        if full_validation {
+            let mut first_property_time_range: BTreeMap<&str, Option<&TimeRangeTransform>> =
+                BTreeMap::new();
+            for index in indices.values() {
+                let Some(first) = index.properties.first() else {
+                    continue;
+                };
+                let transform = index.time_range.as_ref();
+                match first_property_time_range.get(first.name.as_str()) {
+                    Some(existing) if *existing != transform => {
+                        return Err(consensus_or_protocol_data_contract_error(
+                            DataContractError::InvalidContractStructure(format!(
+                                "indices that share the first property \"{}\" must agree on its \
+                                 timeRange transform: either all bucket it identically or none \
+                                 do",
+                                first.name
+                            )),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        first_property_time_range.insert(first.name.as_str(), transform);
+                    }
+                }
+            }
+        }
 
         let index_structure =
             IndexLevel::try_from_indices(indices.values(), name, platform_version)?;
