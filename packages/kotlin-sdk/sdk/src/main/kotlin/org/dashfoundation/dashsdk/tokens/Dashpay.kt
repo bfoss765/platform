@@ -3,7 +3,9 @@ package org.dashfoundation.dashsdk.tokens
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.dashfoundation.dashsdk.errors.DashSdkError
 import org.dashfoundation.dashsdk.errors.mapNativeErrors
+import org.dashfoundation.dashsdk.ffi.DashSDKException
 import org.dashfoundation.dashsdk.ffi.DashpayNative
 import org.dashfoundation.dashsdk.ffi.NativeCleaner
 import org.dashfoundation.dashsdk.ffi.TokensNative
@@ -194,7 +196,7 @@ class Dashpay internal constructor(private val walletHandle: Long) {
      */
     suspend fun contacts(identityId: ByteArray): Contacts = withContext(Dispatchers.IO) {
         mapNativeErrors {
-            val identityHandle = TokensNative.getManagedIdentity(walletHandle, identityId)
+            val identityHandle = managedIdentityHandleOrZero(identityId)
             if (identityHandle == 0L) {
                 return@mapNativeErrors Contacts(emptyList(), emptyList(), emptyList())
             }
@@ -232,7 +234,7 @@ class Dashpay internal constructor(private val walletHandle: Long) {
         coreSignerHandle: Long,
     ): Boolean = withContext(Dispatchers.IO) {
         mapNativeErrors {
-            val identityHandle = TokensNative.getManagedIdentity(walletHandle, ourIdentityId)
+            val identityHandle = managedIdentityHandleOrZero(ourIdentityId)
             if (identityHandle == 0L) return@mapNativeErrors false
             try {
                 val requestHandle =
@@ -425,11 +427,23 @@ class Dashpay internal constructor(private val walletHandle: Long) {
      * [acceptIncomingRequest] discipline). Returns null when the
      * identity isn't managed by this wallet.
      */
+    /**
+     * Snapshot the managed identity for [identityId], or 0 when the wallet
+     * does not manage it. The native side reports an unmanaged identity as
+     * a platform-wallet NotFound error rather than a zero handle, so the
+     * "not managed" outcome is translated here — every local-read caller
+     * treats it as an absence (null / empty / false), never an exception.
+     */
+    private fun managedIdentityHandleOrZero(identityId: ByteArray): Long =
+        translateManagedIdentityNotFoundToZero {
+            TokensNative.getManagedIdentity(walletHandle, identityId)
+        }
+
     private inline fun <T> withManagedIdentity(
         identityId: ByteArray,
         block: (Long) -> T,
     ): T? {
-        val handle = TokensNative.getManagedIdentity(walletHandle, identityId)
+        val handle = managedIdentityHandleOrZero(identityId)
         if (handle == 0L) return null
         return try {
             block(handle)
@@ -526,3 +540,28 @@ class EstablishedContactRef internal constructor(handle: Long) : AutoCloseable {
         }
     }
 }
+
+// ── Free functions (unit-testable, no `this`) ─────────────────────────
+
+/**
+ * Run [getHandle] (a `TokensNative.getManagedIdentity` call), translating
+ * the platform-wallet NotFound error the native layer raises for an
+ * identity the wallet does not manage into a zero handle — the same "not
+ * managed" signal the callers already handle by returning null / empty.
+ *
+ * The FFI's blanket `Option → result` conversion reports the miss as
+ * `PlatformWalletFFIResultCode::NotFound` (98, offset into the
+ * `DashSDKException` code by [DashSdkError.PLATFORM_WALLET_CODE_OFFSET]),
+ * so without this every local read over an unmanaged identity — e.g.
+ * [Dashpay.syncState] on a contact's identity — would throw
+ * `DashSdkError.PlatformWallet.Generic("…ManagedIdentity not found")`
+ * instead of returning null. Any other error is rethrown untouched.
+ */
+internal inline fun translateManagedIdentityNotFoundToZero(getHandle: () -> Long): Long =
+    try {
+        getHandle()
+    } catch (e: DashSDKException) {
+        val notFound = DashSdkError.PLATFORM_WALLET_CODE_OFFSET +
+            DashSdkError.PLATFORM_WALLET_NOT_FOUND_CODE
+        if (e.code == notFound) 0L else throw e
+    }
