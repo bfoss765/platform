@@ -6,6 +6,8 @@
 use crate::broadcaster::TransactionBroadcaster;
 use std::time::Duration;
 
+use dashcore::blockdata::transaction::special_transaction::asset_lock::AssetLockPayload;
+use dashcore::blockdata::transaction::special_transaction::TransactionPayload;
 use dashcore::Address as DashAddress;
 use dashcore::{OutPoint, Transaction, TxOut};
 use key_wallet::account::AccountType;
@@ -15,9 +17,14 @@ use key_wallet::signer::ExtendedPubKeySigner;
 use key_wallet::wallet::managed_wallet_info::asset_lock_builder::{
     AssetLockFundingType, CreditOutputFunding,
 };
+use key_wallet::wallet::managed_wallet_info::coin_selection::SelectionError;
+use key_wallet::wallet::managed_wallet_info::fee::FeeRate;
 use key_wallet::wallet::managed_wallet_info::managed_account_operations::ManagedAccountOperations;
+use key_wallet::wallet::managed_wallet_info::transaction_builder::{BuilderError, TransactionBuilder};
+use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet::wallet::Wallet;
+use key_wallet::Utxo;
 
 use crate::changeset::{
     AccountAddressPoolEntry, AccountRegistrationEntry, PlatformWalletChangeSet,
@@ -108,7 +115,32 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             identity_index,
         };
 
-        // 3. Delegate to the key-wallet signer-driven builder.
+        // 3. Fund the asset lock.
+        //
+        // Shielded funding (`AssetLockShieldedAddressTopUp`) must be able to
+        // draw on previously-mixed CoinJoin coins, which live on the DIP-9
+        // CoinJoin derivation account — the pinned key-wallet
+        // `build_asset_lock_with_signer` funds from a SINGLE BIP44 account
+        // only, so those coins counted in the balance but could not be
+        // shielded (dashpay/platform#4073). Route shielded funding through the
+        // union-of-accounts builder; every other funding type keeps the
+        // single-BIP44-account path (spending mixed CoinJoin coins into an
+        // identity registration would de-anonymize them — a deliberate
+        // privacy choice left out of scope here).
+        if funding_type == AssetLockFundingType::AssetLockShieldedAddressTopUp {
+            return self
+                .build_asset_lock_tx_from_all_funding_accounts(
+                    wallet,
+                    info,
+                    account_index,
+                    vec![funding],
+                    DEFAULT_FEE_PER_KB,
+                    signer,
+                )
+                .await;
+        }
+
+        // Delegate to the key-wallet signer-driven builder (single BIP44 account).
         let result = info
             .core_wallet
             .build_asset_lock_with_signer(
@@ -150,6 +182,184 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         };
 
         Ok((result.transaction, path))
+    }
+
+    /// Build + sign an asset-lock transaction whose funding inputs are drawn
+    /// from the UNION of every spendable Core funds account (BIP44 + BIP32 +
+    /// CoinJoin + DashPay), not just the single BIP44 account at
+    /// `account_index`.
+    ///
+    /// ## Why this exists (dashpay/platform#4073)
+    ///
+    /// The pinned key-wallet `ManagedWalletInfo::build_asset_lock_with_signer`
+    /// funds an asset lock from exactly ONE BIP44 standard account: it calls
+    /// `TransactionBuilder::set_funding` on
+    /// `standard_bip44_accounts[account_index]` and signs with a
+    /// single-account path resolver (`funds_acc.address_derivation_path`).
+    /// Previously-mixed CoinJoin coins live on the DIP-9 CoinJoin derivation
+    /// account (`coinjoin_accounts`), so they are counted in the wallet
+    /// balance (which sums `all_funding_accounts`) yet were invisible to the
+    /// asset-lock coin selector — shielding failed with a coin-selection
+    /// "Insufficient funds" even though the wallet-wide balance covered the
+    /// amount.
+    ///
+    /// This method keeps `account_index` as the PRIMARY account (its
+    /// reservation ledger gates concurrent primary-account builds, and change
+    /// flows back to it via `set_funding`'s change address) but ADDS the
+    /// spendable UTXOs of every other funds account as explicit builder
+    /// inputs (`add_inputs`), and signs with a resolver that spans all funds
+    /// accounts. The credit-output key is still derived from the
+    /// shielded-topup account exactly as the single-account builder does
+    /// (peek path → signer pubkey → mark used), so the returned
+    /// `DerivationPath` lines up with the credit-output script the caller
+    /// already peeked.
+    ///
+    /// ## Interim caveat (superseded by the upstream fix)
+    ///
+    /// The clean long-term fix belongs upstream in key-wallet
+    /// (`build_asset_lock_with_signer` gathering inputs + reservations across
+    /// accounts). Until that pin bump lands, this workspace composition makes
+    /// CoinJoin funds shieldable today. `TransactionBuilder::set_funding`
+    /// captures only the PRIMARY account's `ReservationSet` (the type is
+    /// `pub(crate)` in key-wallet, so this crate cannot reserve per-account),
+    /// so inputs selected from non-primary accounts are recorded in the
+    /// primary account's reservation ledger rather than their own. They are
+    /// therefore not protected against a concurrent build on their own
+    /// account for the brief window before the broadcast tx is processed back
+    /// into the wallet (which releases the outpoints from every account's
+    /// ledger). Shielded funding is single-flighted under `shield_guard` and
+    /// the whole build runs under the wallet write lock, and the app issues no
+    /// concurrent non-shielded spend on the CoinJoin/BIP32 accounts, so the
+    /// race window is not reachable in practice.
+    async fn build_asset_lock_tx_from_all_funding_accounts<S: ExtendedPubKeySigner>(
+        &self,
+        wallet: &Wallet,
+        info: &mut PlatformWalletInfo,
+        account_index: u32,
+        credit_output_fundings: Vec<CreditOutputFunding>,
+        fee_per_kb: u64,
+        signer: &S,
+    ) -> Result<(Transaction, DerivationPath), PlatformWalletError> {
+        use std::collections::{HashMap, HashSet};
+
+        let height = info.core_wallet.last_processed_height();
+
+        // Snapshot the primary account's spendable outpoints so the union
+        // sweep below does not add them twice: `set_funding` already seeds
+        // them, and `add_inputs` must contribute only the OTHER accounts.
+        let primary_outpoints: HashSet<OutPoint> = info
+            .core_wallet
+            .accounts
+            .standard_bip44_accounts
+            .get(&account_index)
+            .map(|a| {
+                a.spendable_utxos(height)
+                    .into_iter()
+                    .map(|u| u.outpoint)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Build, from an immutable borrow of every funds account:
+        //   (a) an owned `Address -> DerivationPath` resolver covering every
+        //       spendable input across ALL accounts, so signing can resolve a
+        //       key for an input selected from any account; and
+        //   (b) the explicit extra inputs (all non-primary accounts).
+        let mut path_map: HashMap<DashAddress, DerivationPath> = HashMap::new();
+        let mut extra_inputs: Vec<Utxo> = Vec::new();
+        for acc in info.core_wallet.accounts.all_funding_accounts() {
+            for utxo in acc.spendable_utxos(height) {
+                if let Some(path) = acc.address_derivation_path(&utxo.address) {
+                    path_map.insert(utxo.address.clone(), path);
+                }
+                if !primary_outpoints.contains(&utxo.outpoint) {
+                    extra_inputs.push(utxo.clone());
+                }
+            }
+        }
+
+        let acc = wallet
+            .get_bip44_account(account_index)
+            .ok_or_else(|| {
+                PlatformWalletError::AssetLockTransaction(format!(
+                    "BIP44 account {account_index} not found for asset-lock funding"
+                ))
+            })?
+            .clone();
+        let credit_outputs: Vec<TxOut> =
+            credit_output_fundings.iter().map(|f| f.output.clone()).collect();
+
+        // Seed the primary account (inputs + change address + reservations),
+        // then append the union of the other accounts' spendable inputs. The
+        // `&mut` borrow of the primary account is scoped to this block; the
+        // returned builder owns cloned inputs / reservations / change address,
+        // so no account borrow is held across the signer await below.
+        let builder = {
+            let primary_funds = info
+                .core_wallet
+                .accounts
+                .standard_bip44_accounts
+                .get_mut(&account_index)
+                .ok_or_else(|| {
+                    PlatformWalletError::AssetLockTransaction(format!(
+                        "managed BIP44 account {account_index} not found for asset-lock funding"
+                    ))
+                })?;
+            TransactionBuilder::new()
+                .set_fee_rate(FeeRate::new(fee_per_kb))
+                .set_current_height(height)
+                .set_special_payload(TransactionPayload::AssetLockPayloadType(
+                    AssetLockPayload::new(credit_outputs),
+                ))
+                .set_funding(primary_funds, &acc)
+                .add_inputs(extra_inputs)
+                .require_final_inputs()
+        };
+
+        let (transaction, _fee) = builder
+            .build_signed(signer, move |addr| path_map.get(&addr).cloned())
+            .await
+            .map_err(map_builder_error)?;
+
+        // Derive the single credit-output key from the shielded-topup account,
+        // mirroring the pinned single-account builder's phase-1/2/3 sequence
+        // (peek without marking → signer round-trip → commit the index) so a
+        // signer failure never irreversibly consumes a pool index.
+        let (path, index) = {
+            let credit_account = info
+                .core_wallet
+                .accounts
+                .asset_lock_shielded_address_topup
+                .as_mut()
+                .ok_or_else(|| {
+                    PlatformWalletError::AssetLockTransaction(
+                        "Asset lock shielded address top-up account not found".to_string(),
+                    )
+                })?;
+            credit_account
+                .peek_next_path()
+                .map_err(|e| PlatformWalletError::AssetLockTransaction(e.to_string()))?
+        };
+        signer.public_key(&path).await.map_err(|e| {
+            PlatformWalletError::AssetLockTransaction(format!("signer public_key failed: {e}"))
+        })?;
+        {
+            let credit_account = info
+                .core_wallet
+                .accounts
+                .asset_lock_shielded_address_topup
+                .as_mut()
+                .ok_or_else(|| {
+                    PlatformWalletError::AssetLockTransaction(
+                        "Asset lock shielded address top-up account not found".to_string(),
+                    )
+                })?;
+            credit_account
+                .mark_first_pool_index_used(index)
+                .map_err(|e| PlatformWalletError::AssetLockTransaction(e.to_string()))?;
+        }
+
+        Ok((transaction, path))
     }
 
     /// Peek at the next unused address from a funding account without
@@ -626,6 +836,32 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
     }
 }
 
+/// Map a key-wallet [`BuilderError`] to a [`PlatformWalletError`], promoting
+/// the two shortfall shapes (`BuilderError::InsufficientFunds` and a
+/// coin-selection `SelectionError::InsufficientFunds`) to the typed
+/// [`PlatformWalletError::AssetLockInsufficientFunds`] so the exact
+/// `available`/`required` duff amounts survive instead of being flattened into
+/// a string (dashpay/platform#4073's typed-error ask). Every other builder
+/// error keeps the generic `AssetLockTransaction` string form.
+fn map_builder_error(e: BuilderError) -> PlatformWalletError {
+    match e {
+        BuilderError::InsufficientFunds {
+            available,
+            required,
+        }
+        | BuilderError::CoinSelection(SelectionError::InsufficientFunds {
+            available,
+            required,
+        }) => PlatformWalletError::AssetLockInsufficientFunds {
+            available,
+            required,
+        },
+        other => {
+            PlatformWalletError::AssetLockTransaction(format!("Asset lock builder failed: {other}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -948,5 +1184,196 @@ mod tests {
             "rebuild must fail at input selection while the reservation is \
              kept for the advanced row, got {rebuild:?}"
         );
+    }
+
+    // -- Multi-account asset-lock funding (dashpay/platform#4073) --
+
+    /// Wraps the split BIP44 + CoinJoin fixture in an `AssetLockManager`.
+    /// `build_asset_lock_transaction` never broadcasts, so the broadcaster is
+    /// irrelevant here.
+    async fn split_asset_lock_manager(
+        bip44_duffs: u64,
+        coinjoin_duffs: u64,
+    ) -> (Arc<AssetLockManager<AlwaysRejectedBroadcaster>>, WalletSigner) {
+        let (wallet_manager, wallet_id, signer) =
+            crate::test_support::split_funded_wallet_manager(bip44_duffs, coinjoin_duffs).await;
+        let persistence = Arc::new(CapturingPersistence::default());
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let manager = Arc::new(AssetLockManager::new(
+            sdk,
+            wallet_manager,
+            wallet_id,
+            Arc::new(Notify::new()),
+            Arc::new(AlwaysRejectedBroadcaster),
+            WalletPersister::new(
+                wallet_id,
+                Arc::clone(&persistence) as Arc<dyn PlatformWalletPersistence>,
+            ),
+        ));
+        (manager, signer)
+    }
+
+    /// The `(BIP44 account 0, CoinJoin account 0)` UTXO outpoint sets, so a
+    /// test can prove a built transaction drew inputs from both accounts.
+    async fn account_outpoints(
+        manager: &AssetLockManager<AlwaysRejectedBroadcaster>,
+    ) -> (
+        std::collections::HashSet<OutPoint>,
+        std::collections::HashSet<OutPoint>,
+    ) {
+        let wm = manager.wallet_manager.read().await;
+        let (_, info) = wm
+            .get_wallet_and_info(&manager.wallet_id)
+            .expect("wallet present");
+        let bip44 = info
+            .core_wallet
+            .accounts
+            .standard_bip44_accounts
+            .get(&0)
+            .map(|a| a.utxos.keys().copied().collect())
+            .unwrap_or_default();
+        let coinjoin = info
+            .core_wallet
+            .accounts
+            .coinjoin_accounts
+            .get(&0)
+            .map(|a| a.utxos.keys().copied().collect())
+            .unwrap_or_default();
+        (bip44, coinjoin)
+    }
+
+    /// The bug: shielded asset-lock funding must be able to spend
+    /// previously-mixed CoinJoin coins, not just the BIP44 slice. Split the
+    /// balance so NEITHER account alone can fund the lock (0.09 DASH each) and
+    /// require 0.15 DASH — coin selection must reach across both the BIP44 and
+    /// the DIP-9 CoinJoin account, and the mixed inputs must each be signed
+    /// under their own account's derivation path.
+    #[tokio::test]
+    async fn shielded_asset_lock_funds_from_bip44_and_coinjoin_union() {
+        // 0.09 DASH on BIP44, 0.09 DASH on CoinJoin; require 0.15 DASH.
+        let (manager, signer) = split_asset_lock_manager(9_000_000, 9_000_000).await;
+        let (bip44_outpoints, coinjoin_outpoints) = account_outpoints(&manager).await;
+
+        let (tx, _path) = manager
+            .build_asset_lock_transaction(
+                15_000_000,
+                0,
+                AssetLockFundingType::AssetLockShieldedAddressTopUp,
+                0,
+                &signer,
+            )
+            .await
+            .expect("shielded asset lock must fund from the BIP44 + CoinJoin union");
+
+        // Neither account alone covers 0.15 DASH, so both must be selected.
+        let spent: std::collections::HashSet<OutPoint> =
+            tx.input.iter().map(|i| i.previous_output).collect();
+        assert!(
+            spent.iter().any(|o| bip44_outpoints.contains(o)),
+            "expected at least one BIP44 input, tx spent {spent:?}"
+        );
+        assert!(
+            spent.iter().any(|o| coinjoin_outpoints.contains(o)),
+            "expected at least one CoinJoin input (the #4073 fix), tx spent {spent:?}"
+        );
+
+        // Per-account signing: every selected input, regardless of which
+        // account's derivation path it needed, must carry a signature.
+        assert!(!tx.input.is_empty(), "asset lock must have selected inputs");
+        for (i, txin) in tx.input.iter().enumerate() {
+            assert!(
+                !txin.script_sig.is_empty(),
+                "input {i} ({}) has an empty script_sig — the cross-account \
+                 resolver failed to derive/sign its key",
+                txin.previous_output
+            );
+        }
+    }
+
+    /// The widening is deliberately scoped to shielded funding: spending mixed
+    /// CoinJoin coins into an identity registration would de-anonymize them.
+    /// With the balance split 0.09/0.09, an identity-registration lock for
+    /// 0.15 DASH must still fail (BIP44 alone is short) while the shielded lock
+    /// for the same amount succeeds from the union.
+    #[tokio::test]
+    async fn non_shielded_asset_lock_stays_single_bip44_account() {
+        let (manager, signer) = split_asset_lock_manager(9_000_000, 9_000_000).await;
+
+        let identity = manager
+            .build_asset_lock_transaction(
+                15_000_000,
+                0,
+                AssetLockFundingType::IdentityRegistration,
+                0,
+                &signer,
+            )
+            .await;
+        assert!(
+            identity.is_err(),
+            "identity registration must NOT reach CoinJoin coins — BIP44 alone \
+             is short of 0.15 DASH, got {identity:?}"
+        );
+
+        let shielded = manager
+            .build_asset_lock_transaction(
+                15_000_000,
+                0,
+                AssetLockFundingType::AssetLockShieldedAddressTopUp,
+                0,
+                &signer,
+            )
+            .await;
+        assert!(
+            shielded.is_ok(),
+            "shielded funding must reach the union, got {shielded:?}"
+        );
+    }
+
+    /// A shielded lock exceeding even the UNION balance surfaces the typed
+    /// [`PlatformWalletError::AssetLockInsufficientFunds`], and its `available`
+    /// reflects the whole spendable balance (both accounts), not the BIP44
+    /// slice — the pre-#4073 symptom was `available` reporting only the BIP44
+    /// portion.
+    #[tokio::test]
+    async fn shielded_asset_lock_union_shortfall_is_typed() {
+        // Union spendable is 0.18 DASH; ask for 1.0 DASH.
+        let (manager, signer) = split_asset_lock_manager(9_000_000, 9_000_000).await;
+
+        let result = manager
+            .build_asset_lock_transaction(
+                100_000_000,
+                0,
+                AssetLockFundingType::AssetLockShieldedAddressTopUp,
+                0,
+                &signer,
+            )
+            .await;
+
+        match result {
+            Err(PlatformWalletError::AssetLockInsufficientFunds {
+                available,
+                required,
+            }) => {
+                // `available` must reflect the union (both 0.09 UTXOs), i.e.
+                // strictly more than the BIP44-only slice the old path saw.
+                assert!(
+                    available > 9_000_000,
+                    "available ({available}) should reflect the BIP44 + CoinJoin \
+                     union (> the 9_000_000 BIP44 slice)"
+                );
+                assert!(
+                    available <= 18_000_000,
+                    "available ({available}) cannot exceed the 18_000_000 union"
+                );
+                assert!(
+                    required >= 100_000_000,
+                    "required ({required}) should be at least the requested amount"
+                );
+            }
+            other => panic!(
+                "expected typed AssetLockInsufficientFunds carrying the union \
+                 available/required, got {other:?}"
+            ),
+        }
     }
 }
