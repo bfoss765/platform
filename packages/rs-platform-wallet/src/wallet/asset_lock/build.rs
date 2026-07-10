@@ -17,7 +17,7 @@ use key_wallet::signer::ExtendedPubKeySigner;
 use key_wallet::wallet::managed_wallet_info::asset_lock_builder::{
     AssetLockFundingType, CreditOutputFunding,
 };
-use key_wallet::wallet::managed_wallet_info::coin_selection::SelectionError;
+use key_wallet::wallet::managed_wallet_info::coin_selection::{SelectionError, SelectionStrategy};
 use key_wallet::wallet::managed_wallet_info::fee::FeeRate;
 use key_wallet::wallet::managed_wallet_info::managed_account_operations::ManagedAccountOperations;
 use key_wallet::wallet::managed_wallet_info::transaction_builder::{BuilderError, TransactionBuilder};
@@ -242,7 +242,15 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
     ) -> Result<(Transaction, DerivationPath), PlatformWalletError> {
         use std::collections::{HashMap, HashSet};
 
+        let target_duffs: u64 = credit_output_fundings.iter().map(|f| f.output.value).sum();
         let height = info.core_wallet.last_processed_height();
+        tracing::debug!(
+            target_duffs,
+            height,
+            primary_account_index = account_index,
+            funding_accounts = info.core_wallet.accounts.all_funding_accounts().len(),
+            "multi-account asset-lock funding: enumerating spendable funds accounts"
+        );
 
         // Snapshot the primary account's spendable outpoints so the union
         // sweep below does not add them twice: `set_funding` already seeds
@@ -267,8 +275,12 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         //   (b) the explicit extra inputs (all non-primary accounts).
         let mut path_map: HashMap<DashAddress, DerivationPath> = HashMap::new();
         let mut extra_inputs: Vec<Utxo> = Vec::new();
+        let mut union_value: u64 = 0;
+        let mut union_count: usize = 0;
         for acc in info.core_wallet.accounts.all_funding_accounts() {
             for utxo in acc.spendable_utxos(height) {
+                union_value = union_value.saturating_add(utxo.value());
+                union_count += 1;
                 if let Some(path) = acc.address_derivation_path(&utxo.address) {
                     path_map.insert(utxo.address.clone(), path);
                 }
@@ -277,6 +289,14 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
                 }
             }
         }
+        tracing::debug!(
+            union_count,
+            union_value,
+            primary_count = primary_outpoints.len(),
+            extra_count = extra_inputs.len(),
+            resolver_entries = path_map.len(),
+            "multi-account asset-lock funding: union UTXO set assembled"
+        );
 
         let acc = wallet
             .get_bip44_account(account_index)
@@ -308,6 +328,21 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             TransactionBuilder::new()
                 .set_fee_rate(FeeRate::new(fee_per_kb))
                 .set_current_height(height)
+                // LargestFirst, NOT the `TransactionBuilder::new()` default
+                // `BranchAndBound`. This is load-bearing, not an optimization:
+                // BranchAndBound routes to a recursive exact-match subset-sum
+                // (`CoinSelector::find_exact_match`) whose search space is
+                // EXPONENTIAL in the number of sub-target UTXOs. The
+                // single-BIP44-account path tolerates it (a handful of UTXOs),
+                // but a CoinJoin account holds many small mixed denominations
+                // (0.001 / 0.01 / 0.1 DASH ...); feeding that whole set to
+                // BranchAndBound hangs the FFI call for minutes with no logs and
+                // no broadcast (observed on-device, dashpay/platform#4073
+                // follow-up). LargestFirst uses the linear greedy accumulator
+                // (`accumulate_coins_with_size`), which also minimizes the input
+                // count — fewer signer round-trips (each input is one resolver
+                // upcall) and a smaller tx/fee.
+                .set_selection_strategy(SelectionStrategy::LargestFirst)
                 .set_special_payload(TransactionPayload::AssetLockPayloadType(
                     AssetLockPayload::new(credit_outputs),
                 ))
@@ -316,10 +351,20 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
                 .require_final_inputs()
         };
 
-        let (transaction, _fee) = builder
+        tracing::debug!(
+            target_duffs,
+            "multi-account asset-lock funding: selecting + signing (LargestFirst)"
+        );
+        let (transaction, fee) = builder
             .build_signed(signer, move |addr| path_map.get(&addr).cloned())
             .await
             .map_err(map_builder_error)?;
+        tracing::debug!(
+            selected_inputs = transaction.input.len(),
+            fee,
+            txid = %transaction.txid(),
+            "multi-account asset-lock funding: transaction built + signed"
+        );
 
         // Derive the single credit-output key from the shielded-topup account,
         // mirroring the pinned single-account builder's phase-1/2/3 sequence
@@ -359,6 +404,10 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
                 .map_err(|e| PlatformWalletError::AssetLockTransaction(e.to_string()))?;
         }
 
+        tracing::debug!(
+            selected_inputs = transaction.input.len(),
+            "multi-account asset-lock funding: credit-output key derived; returning built tx"
+        );
         Ok((transaction, path))
     }
 
@@ -1213,6 +1262,33 @@ mod tests {
         (manager, signer)
     }
 
+    /// Wraps the many-CoinJoin-UTXO fixture in an `AssetLockManager`.
+    async fn split_asset_lock_manager_many_coinjoin(
+        bip44_duffs: u64,
+        coinjoin_values: &[u64],
+    ) -> (Arc<AssetLockManager<AlwaysRejectedBroadcaster>>, WalletSigner) {
+        let (wallet_manager, wallet_id, signer) =
+            crate::test_support::split_funded_wallet_manager_many_coinjoin(
+                bip44_duffs,
+                coinjoin_values,
+            )
+            .await;
+        let persistence = Arc::new(CapturingPersistence::default());
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let manager = Arc::new(AssetLockManager::new(
+            sdk,
+            wallet_manager,
+            wallet_id,
+            Arc::new(Notify::new()),
+            Arc::new(AlwaysRejectedBroadcaster),
+            WalletPersister::new(
+                wallet_id,
+                Arc::clone(&persistence) as Arc<dyn PlatformWalletPersistence>,
+            ),
+        ));
+        (manager, signer)
+    }
+
     /// The `(BIP44 account 0, CoinJoin account 0)` UTXO outpoint sets, so a
     /// test can prove a built transaction drew inputs from both accounts.
     async fn account_outpoints(
@@ -1373,6 +1449,86 @@ mod tests {
             other => panic!(
                 "expected typed AssetLockInsufficientFunds carrying the union \
                  available/required, got {other:?}"
+            ),
+        }
+    }
+
+    /// On-device regression: a real CoinJoin account holds many small mixed
+    /// denominations. The first version of the multi-account builder inherited
+    /// `TransactionBuilder`'s default `BranchAndBound`, whose recursive
+    /// exact-match subset-sum (`CoinSelector::find_exact_match`) is EXPONENTIAL
+    /// in the count of sub-target UTXOs — feeding it a large CoinJoin set hung
+    /// the whole FFI call for minutes with no logs and no broadcast. The builder
+    /// now pins `LargestFirst` (linear greedy).
+    ///
+    /// The blowup is SYNCHRONOUS CPU work with no `.await` points, so it cannot
+    /// be interrupted by `tokio::time::timeout` (that is exactly why on-device
+    /// it hangs RUNNABLE-in-native and the enclosing coroutine never yields).
+    /// The build therefore runs on a **detached OS thread**, and the test body
+    /// waits on a channel with a wall-clock deadline: a regression to an
+    /// exponential strategy makes `recv_timeout` fire and the test FAIL (rather
+    /// than hang the whole suite). The detached thread is reclaimed at process
+    /// exit; on the happy path (LargestFirst) it finishes in well under a
+    /// millisecond and the channel delivers immediately.
+    #[test]
+    fn shielded_asset_lock_over_many_coinjoin_utxos_does_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 40 x 0.02 DASH CoinJoin UTXOs (0.8 DASH), 0.09 DASH on BIP44; shield
+        // 0.2 DASH. BranchAndBound would explore ~sum_k C(40, k<=10) subsets —
+        // empirically minutes+; LargestFirst returns instantly.
+        let coinjoin: Vec<u64> = vec![2_000_000; 40];
+
+        // Fixture build is async; drive it on a throwaway current-thread runtime.
+        let setup_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("setup runtime");
+        let (manager, signer) =
+            setup_rt.block_on(split_asset_lock_manager_many_coinjoin(9_000_000, &coinjoin));
+
+        let (result_tx, result_rx) = mpsc::channel();
+        // Detached: NOT joined anywhere, so a hung build can't wedge runtime
+        // teardown; libtest reclaims it at process exit.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime");
+            let outcome = rt
+                .block_on(manager.build_asset_lock_transaction(
+                    20_000_000,
+                    0,
+                    AssetLockFundingType::AssetLockShieldedAddressTopUp,
+                    0,
+                    &signer,
+                ))
+                .map(|(tx, _path)| tx);
+            let _ = result_tx.send(outcome);
+        });
+
+        // LargestFirst completes in ~25ms; a 30s deadline is a ~1000x margin
+        // against CI contention while still bounding a regression to an
+        // exponential strategy (which never returns) to a prompt failure.
+        match result_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(tx)) => {
+                // LargestFirst minimizes the input count; every selected input
+                // must be signed under its own account's derivation path.
+                assert!(!tx.input.is_empty(), "must select inputs");
+                for txin in &tx.input {
+                    assert!(
+                        !txin.script_sig.is_empty(),
+                        "input {} is unsigned",
+                        txin.previous_output
+                    );
+                }
+            }
+            Ok(Err(e)) => panic!("funding must succeed from the CoinJoin union, got {e:?}"),
+            Err(_) => panic!(
+                "multi-account asset-lock funding did not return within 30s — \
+                 regression to an exponential coin-selection strategy over the \
+                 CoinJoin UTXO set (dashpay/platform#4073 on-device hang)"
             ),
         }
     }
