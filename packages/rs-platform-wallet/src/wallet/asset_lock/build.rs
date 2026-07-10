@@ -1835,4 +1835,98 @@ mod tests {
             );
         }
     }
+
+    /// Heavy-mixer CoinJoin discovery (dashpay/dash-wallet#1507): the CoinJoin
+    /// account's default gap limit must watch a discovery window wide enough to
+    /// bridge the address gaps a heavy mixer leaves — matched to dashj's
+    /// ~100-key lookahead. Index 50 is beyond the OLD 30-address window; a fresh
+    /// account must pre-generate it (so the BIP158 filter watches it) and
+    /// recognize a tx paying it. On the old gap of 30 the address was never
+    /// watched, so txs at far CoinJoin indices were skipped entirely — the
+    /// starvation that survived a clean re-creation + full rescan, missing both
+    /// the txs that created far-index UTXOs and the txs that spent nearer ones.
+    #[tokio::test]
+    async fn coinjoin_gap_limit_discovers_addresses_beyond_the_old_window() {
+        use key_wallet::managed_account::address_pool::AddressPoolType;
+        use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
+        use key_wallet::transaction_checking::{
+            BlockInfo, TransactionContext, WalletTransactionChecker,
+        };
+
+        // Fresh wallet (BIP44 funded, CoinJoin account provisioned but empty).
+        let (wallet_manager, wallet_id, _signer) =
+            crate::test_support::split_funded_wallet_manager_many_coinjoin(9_000_000, &[]).await;
+
+        // `far_index` sits past the old 30-address gap but within dashj's window.
+        let far_index: u32 = 50;
+        let far_address = {
+            let wm = wallet_manager.read().await;
+            let (_, info) = wm.get_wallet_and_info(&wallet_id).expect("wallet present");
+            let cj = info
+                .core_wallet
+                .accounts
+                .coinjoin_accounts
+                .get(&0)
+                .expect("coinjoin account 0");
+            assert_eq!(
+                cj.gap_limit(),
+                Some(100),
+                "CoinJoin gap limit must match dashj's lookahead (100)"
+            );
+            let external = cj
+                .managed_account_type()
+                .address_pools()
+                .into_iter()
+                .find(|p| p.pool_type == AddressPoolType::External)
+                .expect("external CoinJoin pool");
+            // The load-bearing assertion: index 50 is pre-generated (and thus
+            // filter-watched) ONLY because the gap was widened. On the old gap
+            // of 30 this is `None` and the address below can't be fetched.
+            external
+                .address_at_index(far_index)
+                .expect("index 50 must be pre-generated with the widened CoinJoin gap")
+        };
+
+        // A tx paying the far-index CoinJoin address must be discovered and its
+        // UTXO tracked — proving the filter watched an address the old window
+        // would have missed.
+        let tx = Transaction::dummy(&far_address, 0..1, &[12_345_678]);
+        let result = {
+            let mut wm = wallet_manager.write().await;
+            let (wallet, info) = wm
+                .get_wallet_mut_and_info_mut(&wallet_id)
+                .expect("wallet present");
+            info.core_wallet
+                .check_core_transaction(
+                    &tx,
+                    TransactionContext::InChainLockedBlock(BlockInfo::new(
+                        5,
+                        dashcore::BlockHash::from_raw_hash(dashcore::hashes::Hash::all_zeros()),
+                        1_700_002_000,
+                    )),
+                    wallet,
+                    true,
+                    true,
+                )
+                .await
+        };
+        assert!(
+            result.is_relevant,
+            "a payment to the far-index CoinJoin address must be discovered"
+        );
+        assert!(result.is_new_transaction);
+
+        let wm = wallet_manager.read().await;
+        let (_, info) = wm.get_wallet_and_info(&wallet_id).expect("wallet present");
+        let cj = info
+            .core_wallet
+            .accounts
+            .coinjoin_accounts
+            .get(&0)
+            .expect("coinjoin account 0");
+        assert!(
+            cj.utxos.values().any(|u| u.txout.value == 12_345_678),
+            "the far-index CoinJoin UTXO must be tracked after discovery"
+        );
+    }
 }
