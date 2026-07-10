@@ -411,6 +411,108 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         Ok((transaction, path))
     }
 
+    /// Debit the just-broadcast asset-lock transaction's spent inputs that
+    /// belong to funds accounts the pinned `TransactionRouter` OMITS for
+    /// `AssetLock` transactions, and republish the corrected aggregate balance.
+    ///
+    /// ## Why (dashpay/dash-wallet#1507)
+    ///
+    /// `TransactionRouter::get_relevant_account_types(TransactionType::AssetLock)`
+    /// (key-wallet `transaction_checking/transaction_router/mod.rs`) returns
+    /// BIP44 + BIP32 + the identity / asset-lock key accounts, but NOT
+    /// `CoinJoin`, `DashpayReceivingFunds`, or `DashpayExternalAccount`.
+    /// `check_core_transaction` — the ONLY path that marks a spent UTXO spent,
+    /// run by dash-spv on both the mempool relay and the block-confirmation
+    /// scan — scopes its spend detection to those relevant types, so it never
+    /// debits inputs drawn from the omitted accounts. Before the multi-account
+    /// funding builder existed an asset lock only ever spent BIP44, so the gap
+    /// was invisible; now a CoinJoin-funded shield spends CoinJoin UTXOs the
+    /// wallet keeps counting forever. The change output is a BIP44 address, so
+    /// it IS credited — the balance ends up high by exactly the CoinJoin amount
+    /// spent (observed on-device: change credited, CoinJoin inputs never
+    /// debited, unspent-count delta = the full spent amount).
+    ///
+    /// ## What
+    ///
+    /// Removes the spent outpoints from the owning CoinJoin/DashPay account's
+    /// UTXO set (leaving BIP44/BIP32 to the pinned path, which debits those
+    /// correctly) and republishes the aggregate to the lock-free
+    /// [`WalletBalance`](crate::wallet::core::WalletBalance) atomics the SDK
+    /// reads. [`WalletInfoInterface::update_balance`] sums every funds account
+    /// from its current UTXO map, so once these UTXOs are gone every later
+    /// recompute — dash-spv's mempool/confirmation events included — is correct
+    /// too (this is idempotent with, and order-independent of, that async
+    /// processing). No-op when the transaction spends nothing on a
+    /// router-omitted account (every single-BIP44-account asset lock).
+    ///
+    /// Interim mitigation. The real fix adds `CoinJoin` + DashPay to the
+    /// upstream `get_relevant_account_types(AssetLock)` so `record_transaction`
+    /// debits them properly (patch attached to the PR); this method becomes a
+    /// no-op once the pin is bumped (nothing left on a router-omitted account
+    /// to remove because the pinned path already did it).
+    async fn debit_router_omitted_asset_lock_spends(&self, tx: &Transaction) {
+        use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+
+        let spent: std::collections::HashSet<OutPoint> =
+            tx.input.iter().map(|i| i.previous_output).collect();
+
+        let mut wm = self.wallet_manager.write().await;
+        let Some(info) = wm.get_wallet_info_mut(&self.wallet_id) else {
+            return;
+        };
+
+        // Remove spent inputs from the router-omitted funds accounts only
+        // (CoinJoin + DashPay). BIP44/BIP32 spends are debited by the pinned
+        // `check_core_transaction`; touching them here would drop the UTXO
+        // before that path writes its transaction record.
+        let accounts = &mut info.core_wallet.accounts;
+        let mut removed_inputs = 0usize;
+        let mut removed_value = 0u64;
+        for outpoint in &spent {
+            for acc in accounts.coinjoin_accounts.values_mut() {
+                if let Some(utxo) = acc.utxos.remove(outpoint) {
+                    removed_inputs += 1;
+                    removed_value = removed_value.saturating_add(utxo.txout.value);
+                }
+            }
+            for acc in accounts.dashpay_receival_accounts.values_mut() {
+                if let Some(utxo) = acc.utxos.remove(outpoint) {
+                    removed_inputs += 1;
+                    removed_value = removed_value.saturating_add(utxo.txout.value);
+                }
+            }
+            for acc in accounts.dashpay_external_accounts.values_mut() {
+                if let Some(utxo) = acc.utxos.remove(outpoint) {
+                    removed_inputs += 1;
+                    removed_value = removed_value.saturating_add(utxo.txout.value);
+                }
+            }
+        }
+
+        if removed_inputs == 0 {
+            // Single-account (BIP44/BIP32) asset lock: the pinned path covers it.
+            return;
+        }
+
+        info.core_wallet.update_balance();
+        let aggregate = WalletInfoInterface::balance(&info.core_wallet);
+        info.balance.set(
+            aggregate.confirmed(),
+            aggregate.unconfirmed(),
+            aggregate.immature(),
+            aggregate.locked(),
+        );
+
+        tracing::debug!(
+            removed_inputs,
+            removed_value,
+            confirmed = aggregate.confirmed(),
+            unconfirmed = aggregate.unconfirmed(),
+            "debited CoinJoin/DashPay asset-lock spends the pinned AssetLock router omits; \
+             republished aggregate balance to the lock-free atomics"
+        );
+    }
+
     /// Peek at the next unused address from a funding account without
     /// consuming it (i.e. without marking it as used).
     ///
@@ -853,6 +955,18 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             .advance_asset_lock_status(&out_point, AssetLockStatus::Broadcast, None)
             .await?;
         self.queue_asset_lock_changeset(cs_broadcast);
+
+        // 4b. Debit the spends the pinned `AssetLock` transaction router omits.
+        //     Only the shielded multi-account builder
+        //     (`build_asset_lock_tx_from_all_funding_accounts`) draws on the
+        //     CoinJoin / DashPay accounts, and those are exactly the accounts
+        //     `get_relevant_account_types(AssetLock)` leaves out — so without
+        //     this the wallet's balance stays high by the CoinJoin amount spent
+        //     until an app-side reset (dashpay/dash-wallet#1507). No-op for
+        //     every other funding type (single BIP44 account).
+        if funding_type == AssetLockFundingType::AssetLockShieldedAddressTopUp {
+            self.debit_router_omitted_asset_lock_spends(&tx).await;
+        }
 
         // 5. Wait for proof via SPV events. The 300s bound is an
         //    InstantSend-preference window, NOT a finality timeout: on
@@ -1531,5 +1645,126 @@ mod tests {
                  CoinJoin UTXO set (dashpay/platform#4073 on-device hang)"
             ),
         }
+    }
+
+    /// After a multi-account build + broadcast-track, the wallet's aggregate
+    /// balance must immediately equal `previous − inputs + change`, i.e. drop
+    /// by exactly the locked amount + fee — NOT stay high by the spent CoinJoin
+    /// amount until a confirmation scan (dashpay/dash-wallet#1507).
+    ///
+    /// Reproduces the pinned-router gap first (a CoinJoin-funded asset lock
+    /// credits its change but leaves the CoinJoin inputs counted), then applies
+    /// the workspace mitigation and asserts both the aggregate and the
+    /// SDK-facing lock-free atomics are corrected on the spot.
+    #[tokio::test]
+    async fn multi_account_asset_lock_broadcast_debits_router_omitted_spends_immediately() {
+        use key_wallet::transaction_checking::{TransactionContext, WalletTransactionChecker};
+        use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+
+        // 0.09 DASH on BIP44, one 2.0 DASH CoinJoin UTXO; shield 0.2 DASH.
+        // Under LargestFirst the 2.0 CoinJoin UTXO alone funds it, so the tx
+        // spends ONLY a router-omitted (CoinJoin) input and the change lands
+        // back on BIP44.
+        let (manager, signer) = split_asset_lock_manager(9_000_000, 200_000_000).await;
+
+        // Snapshot the pre-spend aggregate + every funds-account UTXO value.
+        let (before_total, utxo_values) = {
+            let mut wm = manager.wallet_manager.write().await;
+            let info = wm
+                .get_wallet_info_mut(&manager.wallet_id)
+                .expect("wallet present");
+            info.core_wallet.update_balance();
+            let before = WalletInfoInterface::balance(&info.core_wallet).total();
+            let mut values = std::collections::HashMap::new();
+            for acc in info.core_wallet.accounts.all_funding_accounts() {
+                for (op, utxo) in &acc.utxos {
+                    values.insert(*op, utxo.txout.value);
+                }
+            }
+            (before, values)
+        };
+
+        let (tx, _path) = manager
+            .build_asset_lock_transaction(
+                20_000_000,
+                0,
+                AssetLockFundingType::AssetLockShieldedAddressTopUp,
+                0,
+                &signer,
+            )
+            .await
+            .expect("build multi-account asset lock");
+
+        let sum_spent: u64 = tx
+            .input
+            .iter()
+            .map(|i| utxo_values.get(&i.previous_output).copied().unwrap_or(0))
+            .sum();
+        // Wallet-owned outputs = the change (the AssetLock burn is an OP_RETURN).
+        let sum_change: u64 = tx
+            .output
+            .iter()
+            .filter(|o| !o.script_pubkey.is_op_return())
+            .map(|o| o.value)
+            .sum();
+        assert!(sum_spent > 0, "tx must spend a wallet UTXO");
+        assert!(sum_change > 0, "tx must return change to the wallet");
+
+        // Simulate dash-spv's mempool processing: it credits the change (a
+        // BIP44 output) but — via the pinned AssetLock router that omits
+        // CoinJoin — never debits the CoinJoin input.
+        {
+            let mut wm = manager.wallet_manager.write().await;
+            let (wallet, info) = wm
+                .get_wallet_mut_and_info_mut(&manager.wallet_id)
+                .expect("wallet present");
+            info.core_wallet
+                .check_core_transaction(&tx, TransactionContext::Mempool, wallet, true, true)
+                .await;
+        }
+
+        // Bug reproduction: without the mitigation the balance is high by the
+        // full spent amount (change credited, CoinJoin input NOT debited).
+        let buggy_total = {
+            let mut wm = manager.wallet_manager.write().await;
+            let info = wm
+                .get_wallet_info_mut(&manager.wallet_id)
+                .expect("wallet present");
+            info.core_wallet.update_balance();
+            WalletInfoInterface::balance(&info.core_wallet).total()
+        };
+        assert_eq!(
+            buggy_total,
+            before_total + sum_change,
+            "pinned AssetLock router leaves the CoinJoin spend un-debited: balance \
+             jumped up by the change with no input debit"
+        );
+
+        // Mitigation: debit the router-omitted spend + republish the atomics.
+        manager.debit_router_omitted_asset_lock_spends(&tx).await;
+
+        let (after_total, atomics_total) = {
+            let mut wm = manager.wallet_manager.write().await;
+            let info = wm
+                .get_wallet_info_mut(&manager.wallet_id)
+                .expect("wallet present");
+            info.core_wallet.update_balance();
+            (
+                WalletInfoInterface::balance(&info.core_wallet).total(),
+                info.balance.total(),
+            )
+        };
+
+        // previous − inputs + change, immediately (net = −(locked + fee)).
+        assert_eq!(
+            after_total,
+            before_total - sum_spent + sum_change,
+            "aggregate must reflect the debited CoinJoin input immediately"
+        );
+        // And the lock-free atomics the SDK reads were republished to match.
+        assert_eq!(
+            atomics_total, after_total,
+            "SDK-facing WalletBalance atomics must be republished to the corrected total"
+        );
     }
 }
