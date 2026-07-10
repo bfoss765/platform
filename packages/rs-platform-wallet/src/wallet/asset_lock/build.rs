@@ -1647,27 +1647,50 @@ mod tests {
         }
     }
 
-    /// After a multi-account build + broadcast-track, the wallet's aggregate
-    /// balance must immediately equal `previous − inputs + change`, i.e. drop
-    /// by exactly the locked amount + fee — NOT stay high by the spent CoinJoin
-    /// amount until a confirmation scan (dashpay/dash-wallet#1507).
-    ///
-    /// Reproduces the pinned-router gap first (a CoinJoin-funded asset lock
-    /// credits its change but leaves the CoinJoin inputs counted), then applies
-    /// the workspace mitigation and asserts both the aggregate and the
-    /// SDK-facing lock-free atomics are corrected on the spot.
-    #[tokio::test]
-    async fn multi_account_asset_lock_broadcast_debits_router_omitted_spends_immediately() {
-        use key_wallet::transaction_checking::{TransactionContext, WalletTransactionChecker};
+    /// Aggregate wallet balance across all funds accounts (recomputes from the
+    /// current UTXO maps).
+    async fn aggregate_total(manager: &AssetLockManager<AlwaysRejectedBroadcaster>) -> u64 {
+        use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+        let mut wm = manager.wallet_manager.write().await;
+        let info = wm
+            .get_wallet_info_mut(&manager.wallet_id)
+            .expect("wallet present");
+        info.core_wallet.update_balance();
+        WalletInfoInterface::balance(&info.core_wallet).total()
+    }
+
+    /// `true` iff CoinJoin account 0 still holds `outpoint` as an unspent UTXO.
+    async fn coinjoin_has_utxo(
+        manager: &AssetLockManager<AlwaysRejectedBroadcaster>,
+        outpoint: &OutPoint,
+    ) -> bool {
+        let wm = manager.wallet_manager.read().await;
+        let (_, info) = wm
+            .get_wallet_and_info(&manager.wallet_id)
+            .expect("wallet present");
+        info.core_wallet
+            .accounts
+            .coinjoin_accounts
+            .get(&0)
+            .is_some_and(|a| a.utxos.contains_key(outpoint))
+    }
+
+    /// Build a CoinJoin-funded shield over the split fixture and return the
+    /// manager, the pre-spend aggregate, the spent-input total, the wallet
+    /// change total, and the built tx. 0.09 DASH BIP44 + one 2.0 DASH CoinJoin
+    /// UTXO, shield 0.2 DASH — LargestFirst funds it entirely from the CoinJoin
+    /// UTXO, so the tx spends only a CoinJoin input and the change lands on BIP44.
+    async fn build_coinjoin_shield() -> (
+        Arc<AssetLockManager<AlwaysRejectedBroadcaster>>,
+        u64,
+        u64,
+        u64,
+        Transaction,
+    ) {
         use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 
-        // 0.09 DASH on BIP44, one 2.0 DASH CoinJoin UTXO; shield 0.2 DASH.
-        // Under LargestFirst the 2.0 CoinJoin UTXO alone funds it, so the tx
-        // spends ONLY a router-omitted (CoinJoin) input and the change lands
-        // back on BIP44.
         let (manager, signer) = split_asset_lock_manager(9_000_000, 200_000_000).await;
 
-        // Snapshot the pre-spend aggregate + every funds-account UTXO value.
         let (before_total, utxo_values) = {
             let mut wm = manager.wallet_manager.write().await;
             let info = wm
@@ -1707,64 +1730,109 @@ mod tests {
             .filter(|o| !o.script_pubkey.is_op_return())
             .map(|o| o.value)
             .sum();
-        assert!(sum_spent > 0, "tx must spend a wallet UTXO");
+        assert!(sum_spent > 0, "tx must spend a wallet (CoinJoin) UTXO");
         assert!(sum_change > 0, "tx must return change to the wallet");
 
-        // Simulate dash-spv's mempool processing: it credits the change (a
-        // BIP44 output) but — via the pinned AssetLock router that omits
-        // CoinJoin — never debits the CoinJoin input.
+        (manager, before_total, sum_spent, sum_change, tx)
+    }
+
+    /// THE CASE THE DEVICE IS STUCK ON: after a hard reset the wallet is rebuilt
+    /// from scratch and the asset-lock tx is re-seen by a block/rescan. The
+    /// `check_core_transaction` scan — with NO broadcast-time mitigation in
+    /// play (a rescan never runs the broadcast path) — must debit the spent
+    /// CoinJoin input, so the balance settles to `previous − inputs + change`
+    /// rather than re-inflating by the spent amount and re-triggering the
+    /// reset→rescan→inflate loop. This passes ONLY because the vendored
+    /// rust-dashcore carries the router fix (CoinJoin in the AssetLock relevant
+    /// types); on the un-patched pin the CoinJoin input stays counted.
+    #[tokio::test]
+    async fn router_fix_debits_coinjoin_asset_lock_spend_on_rescan() {
+        use key_wallet::transaction_checking::{TransactionContext, WalletTransactionChecker};
+
+        let (manager, before_total, sum_spent, sum_change, tx) = build_coinjoin_shield().await;
+        let spent_outpoint = tx.input[0].previous_output;
+        assert!(
+            coinjoin_has_utxo(&manager, &spent_outpoint).await,
+            "the CoinJoin UTXO must be present before the scan (rescan re-added it)"
+        );
+
+        // Confirmation/rescan processing ONLY — no broadcast-time mitigation.
         {
             let mut wm = manager.wallet_manager.write().await;
             let (wallet, info) = wm
                 .get_wallet_mut_and_info_mut(&manager.wallet_id)
                 .expect("wallet present");
             info.core_wallet
-                .check_core_transaction(&tx, TransactionContext::Mempool, wallet, true, true)
+                .check_core_transaction(
+                    &tx,
+                    TransactionContext::InChainLockedBlock(key_wallet::transaction_checking::BlockInfo::new(
+                        10,
+                        dashcore::BlockHash::from_raw_hash(dashcore::hashes::Hash::all_zeros()),
+                        1_700_001_000,
+                    )),
+                    wallet,
+                    true,
+                    true,
+                )
                 .await;
         }
 
-        // Bug reproduction: without the mitigation the balance is high by the
-        // full spent amount (change credited, CoinJoin input NOT debited).
-        let buggy_total = {
-            let mut wm = manager.wallet_manager.write().await;
-            let info = wm
-                .get_wallet_info_mut(&manager.wallet_id)
-                .expect("wallet present");
-            info.core_wallet.update_balance();
-            WalletInfoInterface::balance(&info.core_wallet).total()
-        };
-        assert_eq!(
-            buggy_total,
-            before_total + sum_change,
-            "pinned AssetLock router leaves the CoinJoin spend un-debited: balance \
-             jumped up by the change with no input debit"
+        assert!(
+            !coinjoin_has_utxo(&manager, &spent_outpoint).await,
+            "router fix must mark the spent CoinJoin UTXO spent on the scan"
         );
-
-        // Mitigation: debit the router-omitted spend + republish the atomics.
-        manager.debit_router_omitted_asset_lock_spends(&tx).await;
-
-        let (after_total, atomics_total) = {
-            let mut wm = manager.wallet_manager.write().await;
-            let info = wm
-                .get_wallet_info_mut(&manager.wallet_id)
-                .expect("wallet present");
-            info.core_wallet.update_balance();
-            (
-                WalletInfoInterface::balance(&info.core_wallet).total(),
-                info.balance.total(),
-            )
-        };
-
-        // previous − inputs + change, immediately (net = −(locked + fee)).
         assert_eq!(
-            after_total,
+            aggregate_total(&manager).await,
             before_total - sum_spent + sum_change,
-            "aggregate must reflect the debited CoinJoin input immediately"
+            "post-rescan balance must be previous − inputs + change (no re-inflation)"
         );
-        // And the lock-free atomics the SDK reads were republished to match.
-        assert_eq!(
-            atomics_total, after_total,
-            "SDK-facing WalletBalance atomics must be republished to the corrected total"
-        );
+    }
+
+    /// Belt-and-braces: the broadcast-time mitigation and the router fix must
+    /// not double-debit. Runs BOTH, in BOTH orders, and asserts the balance
+    /// lands at exactly `previous − inputs + change` either way (a double debit
+    /// would underflow / land low).
+    #[tokio::test]
+    async fn broadcast_mitigation_and_router_fix_do_not_double_debit() {
+        use key_wallet::transaction_checking::{TransactionContext, WalletTransactionChecker};
+
+        async fn scan(
+            manager: &AssetLockManager<AlwaysRejectedBroadcaster>,
+            tx: &Transaction,
+        ) {
+            let mut wm = manager.wallet_manager.write().await;
+            let (wallet, info) = wm
+                .get_wallet_mut_and_info_mut(&manager.wallet_id)
+                .expect("wallet present");
+            info.core_wallet
+                .check_core_transaction(tx, TransactionContext::Mempool, wallet, true, true)
+                .await;
+        }
+
+        // Order A: broadcast mitigation first (production timing), then the
+        // dash-spv scan. The scan finds the CoinJoin UTXO already gone.
+        {
+            let (manager, before_total, sum_spent, sum_change, tx) = build_coinjoin_shield().await;
+            manager.debit_router_omitted_asset_lock_spends(&tx).await;
+            scan(&manager, &tx).await;
+            assert_eq!(
+                aggregate_total(&manager).await,
+                before_total - sum_spent + sum_change,
+                "mitigation-then-scan must not double-debit"
+            );
+        }
+
+        // Order B: dash-spv scan first (router fix debits + credits), then the
+        // broadcast mitigation runs and finds nothing left to remove (no-op).
+        {
+            let (manager, before_total, sum_spent, sum_change, tx) = build_coinjoin_shield().await;
+            scan(&manager, &tx).await;
+            manager.debit_router_omitted_asset_lock_spends(&tx).await;
+            assert_eq!(
+                aggregate_total(&manager).await,
+                before_total - sum_spent + sum_change,
+                "scan-then-mitigation must not double-debit"
+            );
+        }
     }
 }

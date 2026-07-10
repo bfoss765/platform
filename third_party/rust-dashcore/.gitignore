@@ -1,0 +1,52 @@
+target
+Cargo.lock
+
+#fuzz
+fuzz/hfuzz_target
+fuzz/hfuzz_workspace
+
+.idea
+.DS_STORE
+
+# Claude Flow and AI assistant files
+.claude-flow.pid
+.claude/
+.roo/
+.roomodes
+claude-flow
+memory/
+memory-bank.md
+coordination.md
+
+# IDE and editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+**/*.rs.bk
+dash-spv-ffi/include/
+key-wallet-ffi/include/
+*.a
+*.so
+*.dylib
+*.dll
+
+# Test and coverage
+tarpaulin-report.html
+cobertura.xml
+
+# Backup files
+*.backup
+*.bak
+
+# Temporary files
+*.tmp
+.tmp/
+
+# Python
+__pycache__/
+
+# Build scripts artifacts
+*.log

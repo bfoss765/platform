@@ -2,6 +2,12 @@
 
 resolver = "2"
 
+# `third_party/rust-dashcore` is a self-contained, separately-`[workspace]`-rooted
+# vendored copy of the pinned rust-dashcore rev (see the `[patch]` table at the
+# end of this file). Exclude it so it is never treated as a member of THIS
+# workspace — it is only referenced through `[patch]` path overrides.
+exclude = ["third_party/rust-dashcore"]
+
 members = [
     "packages/dapi-grpc",
     "packages/rs-dash-platform-macros",
@@ -129,3 +135,36 @@ opt-level = 3
 
 version = "4.0.0"
 rust-version = "1.92"
+
+# ---------------------------------------------------------------------------
+# TEMPORARY vendoring of the pinned rust-dashcore rev with the asset-lock
+# transaction-router fix applied.
+#
+# The pinned rev 1860089e's `TransactionRouter::get_relevant_account_types(AssetLock)`
+# omits `CoinJoin` (and the DashPay accounts), so `check_core_transaction`
+# never marks CoinJoin inputs spent when an asset lock spends them — a
+# CoinJoin-funded shield's balance re-inflates by the spent amount on every
+# rescan (dashpay/platform#4073, dashpay/dash-wallet#1507). The fix lives in
+# `third_party/rust-dashcore/key-wallet/.../transaction_router/mod.rs` (a slim,
+# separately-workspace-rooted copy of the rev: `.git` and the crates' test
+# data are stripped, since cargo only builds the lib target of a patched
+# dependency). See `assetlock-router-coinjoin.patch` in the PR for the exact
+# upstream diff.
+#
+# Every crate that resolves from the rust-dashcore git source MUST be patched
+# to the same vendored tree — patching only some would split `dashcore` (etc.)
+# into two incompatible instances. Remove this whole block once the fix lands
+# upstream and the workspace `rev` is bumped past it.
+[patch."https://github.com/dashpay/rust-dashcore"]
+dashcore = { path = "third_party/rust-dashcore/dash" }
+dashcore_hashes = { path = "third_party/rust-dashcore/hashes" }
+dashcore-private = { path = "third_party/rust-dashcore/internals" }
+dash-network = { path = "third_party/rust-dashcore/dash-network" }
+dash-network-seeds = { path = "third_party/rust-dashcore/dash-network-seeds" }
+dash-spv = { path = "third_party/rust-dashcore/dash-spv" }
+dashcore-rpc = { path = "third_party/rust-dashcore/rpc-client" }
+dashcore-rpc-json = { path = "third_party/rust-dashcore/rpc-json" }
+git-state = { path = "third_party/rust-dashcore/git-state" }
+key-wallet = { path = "third_party/rust-dashcore/key-wallet" }
+key-wallet-ffi = { path = "third_party/rust-dashcore/key-wallet-ffi" }
+key-wallet-manager = { path = "third_party/rust-dashcore/key-wallet-manager" }

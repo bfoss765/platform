@@ -1,0 +1,316 @@
+//! Tests for wallet backup and restore functionality
+//!
+//! Tests wallet export, import, and recovery scenarios.
+
+use crate::account::{AccountType, StandardAccountType};
+use crate::mnemonic::{Language, Mnemonic};
+use crate::wallet::{Wallet, WalletType};
+use crate::Network;
+
+#[test]
+fn test_wallet_mnemonic_export() {
+    let mnemonic = Mnemonic::from_phrase(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        Language::English,
+    )
+    .unwrap();
+
+    let wallet = Wallet::from_mnemonic(
+        mnemonic.clone(),
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Export mnemonic
+    match &wallet.wallet_type {
+        WalletType::Mnemonic {
+            mnemonic: exported,
+            ..
+        } => {
+            assert_eq!(exported.to_string(), mnemonic.to_string());
+        }
+        _ => panic!("Expected mnemonic wallet"),
+    }
+}
+
+#[test]
+fn test_wallet_full_backup_restore() {
+    let mut original_wallet = Wallet::new_random(
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Add various accounts including 0 since None doesn't create any
+    for i in 0..3 {
+        original_wallet
+            .add_account(
+                AccountType::Standard {
+                    index: i,
+                    standard_account_type: StandardAccountType::BIP44Account,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    original_wallet
+        .add_account(
+            AccountType::CoinJoin {
+                index: 0,
+            },
+            None,
+        )
+        .unwrap();
+
+    // Export wallet data
+    let wallet_id = original_wallet.wallet_id;
+    let mnemonic = match &original_wallet.wallet_type {
+        WalletType::Mnemonic {
+            mnemonic,
+            ..
+        } => mnemonic.clone(),
+        _ => panic!("Expected mnemonic wallet"),
+    };
+
+    // Simulate wallet destruction
+    drop(original_wallet);
+
+    // Restore wallet
+    let mut restored_wallet = Wallet::from_mnemonic(
+        mnemonic,
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Verify wallet ID matches
+    assert_eq!(restored_wallet.wallet_id, wallet_id);
+
+    // Re-add accounts including 0 since None doesn't create any
+    for i in 0..3 {
+        restored_wallet
+            .add_account(
+                AccountType::Standard {
+                    index: i,
+                    standard_account_type: StandardAccountType::BIP44Account,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    restored_wallet
+        .add_account(
+            AccountType::CoinJoin {
+                index: 0,
+            },
+            None,
+        )
+        .unwrap();
+
+    // Verify account structure restored
+    assert_eq!(restored_wallet.accounts.standard_bip44_accounts.len(), 3); // 0, 1, 2
+    assert_eq!(restored_wallet.accounts.coinjoin_accounts.len(), 1);
+}
+
+#[test]
+fn test_wallet_partial_backup() {
+    // Test backing up only essential data (mnemonic + account indices)
+
+    let mut wallet = Wallet::new_random(
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Add accounts including standard 0 since None doesn't create any
+    let account_metadata = vec![
+        AccountType::Standard {
+            index: 0,
+            standard_account_type: StandardAccountType::BIP44Account,
+        },
+        AccountType::Standard {
+            index: 1,
+            standard_account_type: StandardAccountType::BIP44Account,
+        },
+        AccountType::CoinJoin {
+            index: 0,
+        },
+    ];
+
+    for account_type in &account_metadata {
+        wallet.add_account(*account_type, None).unwrap();
+    }
+
+    // Verify accounts were added
+    assert_eq!(wallet.accounts.standard_bip44_accounts.len(), 2); // indices 0, 1
+    assert_eq!(wallet.accounts.coinjoin_accounts.len(), 1);
+}
+
+#[test]
+fn test_wallet_metadata_backup() {
+    // Test backing up wallet metadata (labels, settings, etc.)
+
+    let mut wallet = Wallet::new_random(
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Add accounts with metadata
+    struct AccountMetadata {
+        account_type: AccountType,
+        label: String,
+        _created_at: u64,
+    }
+
+    let metadata = vec![
+        AccountMetadata {
+            account_type: AccountType::Standard {
+                index: 1, // Use index 1 since 0 is created by default
+                standard_account_type: StandardAccountType::BIP44Account,
+            },
+            label: "Secondary Account".to_string(),
+            _created_at: 1234567890,
+        },
+        AccountMetadata {
+            account_type: AccountType::CoinJoin {
+                index: 0,
+            },
+            label: "Private Account".to_string(),
+            _created_at: 1234567900,
+        },
+    ];
+
+    for item in &metadata {
+        wallet.add_account(item.account_type, None).unwrap();
+    }
+
+    // Verify metadata can be associated with accounts
+    assert_eq!(metadata.len(), 2);
+    assert_eq!(metadata[0].label, "Secondary Account");
+    assert_eq!(metadata[1].label, "Private Account");
+}
+
+#[test]
+fn test_multi_network_backup_restore() {
+    let mnemonic = Mnemonic::from_phrase(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        Language::English,
+    )
+    .unwrap();
+
+    // Create separate wallets for each network
+    let networks = vec![Network::Testnet, Network::Mainnet, Network::Devnet];
+    let mut wallets = Vec::new();
+
+    for network in &networks {
+        let mut wallet = Wallet::from_mnemonic(
+            mnemonic.clone(),
+            *network,
+            crate::wallet::initialization::WalletAccountCreationOptions::None,
+        )
+        .unwrap();
+
+        // Add accounts
+        for i in 0..2 {
+            wallet
+                .add_account(
+                    AccountType::Standard {
+                        index: i,
+                        standard_account_type: StandardAccountType::BIP44Account,
+                    },
+                    None,
+                )
+                .ok();
+        }
+
+        wallets.push(wallet);
+    }
+
+    // Create network-aware backup
+    struct NetworkBackup {
+        network: Network,
+        account_count: usize,
+    }
+
+    let network_backups: Vec<NetworkBackup> = wallets
+        .iter()
+        .map(|w| NetworkBackup {
+            network: w.network,
+            account_count: w.accounts.standard_bip44_accounts.len(),
+        })
+        .collect();
+
+    // Restore each wallet
+    for backup in network_backups {
+        let mut restored = Wallet::from_mnemonic(
+            mnemonic.clone(),
+            backup.network,
+            crate::wallet::initialization::WalletAccountCreationOptions::None,
+        )
+        .unwrap();
+
+        for i in 0..backup.account_count {
+            restored
+                .add_account(
+                    AccountType::Standard {
+                        index: i as u32,
+                        standard_account_type: StandardAccountType::BIP44Account,
+                    },
+                    None,
+                )
+                .ok();
+        }
+
+        assert_eq!(restored.network, backup.network);
+        assert_eq!(restored.accounts.standard_bip44_accounts.len(), backup.account_count);
+    }
+}
+
+#[test]
+fn test_incremental_backup() {
+    // Test incremental backup of changes since last backup
+
+    let mut wallet = Wallet::new_random(
+        Network::Testnet,
+        crate::wallet::initialization::WalletAccountCreationOptions::None,
+    )
+    .unwrap();
+
+    // Initial state - account 0 is created by default, no need to add it
+
+    // Simulate initial backup
+    let initial_account_count = wallet.accounts.standard_bip44_accounts.len();
+
+    // Make changes
+    wallet
+        .add_account(
+            AccountType::Standard {
+                index: 1,
+                standard_account_type: StandardAccountType::BIP44Account,
+            },
+            None,
+        )
+        .unwrap();
+
+    wallet
+        .add_account(
+            AccountType::CoinJoin {
+                index: 0,
+            },
+            None,
+        )
+        .unwrap();
+
+    // Calculate incremental changes
+    let new_account_count = wallet.accounts.standard_bip44_accounts.len();
+
+    let accounts_added = new_account_count - initial_account_count;
+    assert_eq!(accounts_added, 1); // One new standard account
+
+    // Also check CoinJoin account was added
+    assert_eq!(wallet.accounts.coinjoin_accounts.len(), 1);
+}

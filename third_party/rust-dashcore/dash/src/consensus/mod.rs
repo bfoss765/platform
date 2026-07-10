@@ -1,0 +1,29 @@
+// Rust Dash Library
+// Written by
+//   The Rust Dash developers
+//
+// To the extent possible under law, the author(s) have dedicated all
+// copyright and related and neighboring rights to this software to
+// the public domain worldwide. This software is distributed without
+// any warranty.
+//
+// You should have received a copy of the CC0 Public Domain Dedication
+// along with this software.
+// If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
+//
+
+//! Bitcoin consensus.
+//!
+//! This module defines structures, functions, and traits that are needed to
+//! conform to Bitcoin consensus.
+//!
+
+pub mod encode;
+pub mod params;
+#[cfg(feature = "serde")]
+pub mod serde;
+
+pub use self::encode::{
+    Decodable, Encodable, ReadExt, WriteExt, deserialize, deserialize_partial, serialize,
+};
+pub use self::params::Params;

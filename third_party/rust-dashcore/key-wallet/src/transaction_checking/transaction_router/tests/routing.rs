@@ -1,0 +1,450 @@
+//! Tests for transaction routing logic
+
+use super::helpers::{test_addr, test_block_info};
+use crate::account::{AccountType, StandardAccountType};
+use crate::managed_account::address_pool::KeySource;
+use crate::managed_account::managed_account_trait::ManagedAccountTrait;
+use crate::managed_account::managed_account_type::ManagedAccountType;
+use crate::test_utils::TestWalletContext;
+use crate::transaction_checking::transaction_router::{
+    AccountTypeToCheck, TransactionRouter, TransactionType,
+};
+use crate::transaction_checking::{TransactionContext, WalletTransactionChecker};
+use crate::wallet::initialization::WalletAccountCreationOptions;
+use crate::wallet::{ManagedWalletInfo, Wallet};
+use crate::Network;
+use dashcore::blockdata::transaction::Transaction;
+use dashcore::TxOut;
+
+#[test]
+fn test_standard_transaction_routing() {
+    let tx_type = TransactionType::Standard;
+    let accounts = TransactionRouter::get_relevant_account_types(&tx_type);
+
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP44));
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP32));
+    // A standard-shaped tx can still spend or fund a CoinJoin UTXO (small denomination spends
+    // classify as Standard), so the CoinJoin account must be checked too. Discovery is
+    // membership-based, like Dash Core's `IsMine`, not gated on the tx shape.
+    assert!(accounts.contains(&AccountTypeToCheck::CoinJoin));
+}
+
+#[tokio::test]
+async fn test_transaction_routing_to_bip44_account() {
+    let TestWalletContext {
+        managed_wallet: mut managed_wallet_info,
+        mut wallet,
+        receive_address: address,
+        ..
+    } = TestWalletContext::new_random();
+
+    // Create a transaction that sends to this address
+    let addr = test_addr();
+    let mut tx = Transaction::dummy(&addr, 0..1, &[100_000]);
+
+    // Add an output to our address
+    tx.output.push(TxOut {
+        value: 100000,
+        script_pubkey: address.script_pubkey(),
+    });
+
+    // Check the transaction using the wallet's managed info
+    let context = TransactionContext::InBlock(test_block_info(100000));
+
+    // Check the transaction using the managed wallet info
+    let result = managed_wallet_info
+        .check_core_transaction(
+            &tx,
+            context,
+            &mut wallet,
+            true, // update state
+            true, // update balance
+        )
+        .await;
+
+    // The transaction should be recognized as relevant since it sends to our address
+    assert!(result.is_relevant, "Transaction should be relevant to the wallet");
+    assert!(result.total_received > 0, "Should have received funds");
+    assert_eq!(result.total_received, 100000, "Should have received 100000 duffs");
+}
+
+#[tokio::test]
+async fn test_transaction_routing_to_bip32_account() {
+    // Create a wallet with BIP32 accounts
+    let mut wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::None)
+        .expect("Failed to create wallet without default accounts");
+
+    // Add a BIP32 account
+    let account_type = AccountType::Standard {
+        index: 0,
+        standard_account_type: StandardAccountType::BIP32Account,
+    };
+    wallet.add_account(account_type, None).expect("Failed to add account to wallet");
+
+    let mut managed_wallet_info =
+        ManagedWalletInfo::from_wallet_with_name(&wallet, "Test".to_string(), 0);
+
+    // Get the account's xpub for address derivation
+    let account = wallet
+        .accounts
+        .standard_bip32_accounts
+        .get(&0)
+        .expect("Expected BIP32 account at index 0 to exist");
+    let xpub = account.account_xpub;
+
+    // Get an address from the BIP32 account
+    let address = {
+        let managed_account = managed_wallet_info
+            .first_bip32_managed_account_mut()
+            .expect("Failed to get first BIP32 managed account");
+        managed_account
+            .next_receive_address(Some(&xpub), true)
+            .expect("Failed to generate receive address from BIP32 account")
+    };
+
+    // Create a transaction that sends to this address
+    let addr = test_addr();
+    let mut tx = Transaction::dummy(&addr, 0..1, &[100_000]);
+
+    // Add an output to our address
+    tx.output.push(TxOut {
+        value: 50000,
+        script_pubkey: address.script_pubkey(),
+    });
+
+    // Check the transaction using the managed wallet info
+    let context = TransactionContext::InBlock(test_block_info(100000));
+
+    // Check with update_state = false
+    let result = managed_wallet_info
+        .check_core_transaction(&tx, context.clone(), &mut wallet, false, true)
+        .await;
+
+    // The transaction should be recognized as relevant
+    assert!(result.is_relevant, "Transaction should be relevant to the BIP32 account");
+    assert_eq!(result.total_received, 50000, "Should have received 50000 duffs");
+
+    // Verify state was not updated
+    {
+        let managed_account = managed_wallet_info
+            .first_bip32_managed_account_mut()
+            .expect("Failed to get first BIP32 managed account");
+        assert_eq!(
+            managed_account.balance.spendable(),
+            0,
+            "Balance should not be updated when update_state is false"
+        );
+    }
+
+    // Now check with update_state = true
+    let result = managed_wallet_info
+        .check_core_transaction(
+            &tx,
+            context,
+            &mut wallet,
+            true, // update state
+            true, // update balance
+        )
+        .await;
+
+    assert!(result.is_relevant, "Transaction should still be relevant");
+    // Note: Balance update may not work without proper UTXO tracking implementation
+    // This test may fail - that's expected, and we want to find such issues
+}
+
+#[tokio::test]
+async fn test_transaction_routing_to_coinjoin_account() {
+    // Create a wallet and add a CoinJoin account
+    let mut wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::None)
+        .expect("Failed to create wallet without default accounts");
+
+    let account_type = AccountType::CoinJoin {
+        index: 0,
+    };
+    wallet.add_account(account_type, None).expect("Failed to add account to wallet");
+
+    let mut managed_wallet_info =
+        ManagedWalletInfo::from_wallet_with_name(&wallet, "Test".to_string(), 0);
+
+    // Get the account's xpub
+    let account = wallet
+        .accounts
+        .coinjoin_accounts
+        .get(&0)
+        .expect("Expected CoinJoin account at index 0 to exist");
+    let xpub = account.account_xpub;
+
+    // Derive a real address owned by the CoinJoin account so ownership is genuine.
+    let address = {
+        let managed_account = managed_wallet_info
+            .first_coinjoin_managed_account_mut()
+            .expect("Failed to get first CoinJoin managed account");
+        let ManagedAccountType::CoinJoin {
+            external_addresses,
+            ..
+        } = managed_account.managed_account_type_mut()
+        else {
+            panic!("Expected CoinJoin account type");
+        };
+        external_addresses
+            .next_unused(&KeySource::Public(xpub), true)
+            .expect("Failed to derive CoinJoin address")
+    };
+
+    // A small 2-in/2-out CoinJoin denomination spend classifies as `Standard` (the CoinJoin
+    // heuristic needs >= 3 inputs and outputs), yet one output pays our CoinJoin address. Routing
+    // must still attribute it to the CoinJoin account because discovery is membership-based.
+    let addr = test_addr();
+    let mut tx = Transaction::dummy(&addr, 0..2, &[100_001]);
+    tx.output.clear();
+    tx.output.push(TxOut {
+        value: 100_001, // 0.001 DASH + per-round fee, paid to our CoinJoin address
+        script_pubkey: address.script_pubkey(),
+    });
+    tx.output.push(TxOut {
+        value: 100_001, // counterparty output, not ours
+        script_pubkey: test_addr().script_pubkey(),
+    });
+
+    assert_eq!(
+        TransactionRouter::classify_transaction(&tx),
+        TransactionType::Standard,
+        "2-in/2-out denomination spend should classify as Standard"
+    );
+
+    let context = TransactionContext::InBlock(test_block_info(100000));
+
+    let result =
+        managed_wallet_info.check_core_transaction(&tx, context, &mut wallet, true, true).await;
+
+    assert!(result.is_relevant, "CoinJoin spend paying our CoinJoin address should be relevant");
+
+    let coinjoin_account = managed_wallet_info
+        .first_coinjoin_managed_account()
+        .expect("CoinJoin managed account should exist");
+    assert!(
+        coinjoin_account.transactions().contains_key(&tx.txid()),
+        "tx should be attributed to the CoinJoin account"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_affects_multiple_accounts() {
+    // Create a wallet with multiple accounts
+    let mut wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::Default)
+        .expect("Failed to create wallet with default options");
+
+    // Add another BIP44 account
+    let account_type = AccountType::Standard {
+        index: 1,
+        standard_account_type: StandardAccountType::BIP44Account,
+    };
+    wallet.add_account(account_type, None).expect("Failed to add account to wallet");
+
+    // Add another BIP32 account
+    let account_type = AccountType::Standard {
+        index: 1,
+        standard_account_type: StandardAccountType::BIP32Account,
+    };
+    wallet.add_account(account_type, None).expect("Failed to add account to wallet");
+
+    let mut managed_wallet_info =
+        ManagedWalletInfo::from_wallet_with_name(&wallet, "Test".to_string(), 0);
+
+    // Get addresses from different accounts
+
+    // BIP44 account 0
+    let account0 = wallet
+        .accounts
+        .standard_bip44_accounts
+        .get(&0)
+        .expect("Expected BIP44 account at index 0 to exist");
+    let xpub0 = account0.account_xpub;
+    let managed_account0 = managed_wallet_info
+        .bip44_managed_account_at_index_mut(0)
+        .expect("Failed to get BIP44 managed account at index 0");
+    let address0 = managed_account0
+        .next_receive_address(Some(&xpub0), true)
+        .expect("Failed to generate receive address for account 0");
+
+    // BIP44 account 1
+    let account1 = wallet
+        .accounts
+        .standard_bip44_accounts
+        .get(&1)
+        .expect("Expected BIP44 account at index 1 to exist");
+    let xpub1 = account1.account_xpub;
+    let managed_account1 = managed_wallet_info
+        .bip44_managed_account_at_index_mut(1)
+        .expect("Failed to get BIP44 managed account at index 1");
+    let address1 = managed_account1
+        .next_receive_address(Some(&xpub1), true)
+        .expect("Failed to generate receive address for account 1");
+
+    // BIP32 account
+    let account2 = wallet
+        .accounts
+        .standard_bip32_accounts
+        .get(&0)
+        .expect("Expected BIP32 account at index 0 to exist");
+    let xpub2 = account2.account_xpub;
+    let managed_account2 = managed_wallet_info
+        .first_bip32_managed_account_mut()
+        .expect("Failed to get first BIP32 managed account");
+    let address2 = managed_account2
+        .next_receive_address(Some(&xpub2), true)
+        .expect("Failed to generate receive address for BIP32 account");
+
+    // Create a transaction that sends to multiple accounts
+    let addr = test_addr();
+    let mut tx = Transaction::dummy(&addr, 0..1, &[100_000]);
+
+    // Add outputs to different accounts
+    tx.output.push(TxOut {
+        value: 30000,
+        script_pubkey: address0.script_pubkey(),
+    });
+    tx.output.push(TxOut {
+        value: 40000,
+        script_pubkey: address1.script_pubkey(),
+    });
+    tx.output.push(TxOut {
+        value: 50000,
+        script_pubkey: address2.script_pubkey(),
+    });
+
+    let context = TransactionContext::InBlock(test_block_info(100000));
+
+    // Check the transaction
+    let result = managed_wallet_info
+        .check_core_transaction(
+            &tx,
+            context.clone(),
+            &mut wallet,
+            true, // update state
+            true, // update balance
+        )
+        .await;
+
+    // Transaction should be relevant and total should be sum of all outputs
+    assert!(result.is_relevant, "Transaction should be relevant to multiple accounts");
+
+    // NOTE: This assertion is expected to fail if BIP32 accounts aren't properly tracked
+    // The failure shows that only BIP44 accounts (30000 + 40000 = 70000) or possibly
+    // 80000 means something else is being counted
+    assert_eq!(result.total_received, 120000, "Should have received 120000 duffs total");
+
+    // Verify each account was affected
+    // Note: These assertions may fail if the implementation doesn't properly track multiple accounts
+    println!("Multi-account transaction result: accounts_affected={:?}", result.affected_accounts);
+
+    // Test with update_state = false to ensure state isn't modified
+    let result2 =
+        managed_wallet_info.check_core_transaction(&tx, context, &mut wallet, false, true).await;
+
+    assert_eq!(
+        result2.total_received, result.total_received,
+        "Should get same result without state update"
+    );
+}
+
+#[test]
+fn test_next_address_method_restrictions() {
+    let wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::Default)
+        .expect("Failed to create wallet with default options");
+    let mut managed_wallet_info =
+        ManagedWalletInfo::from_wallet_with_name(&wallet, "Test".to_string(), 0);
+
+    // Test that standard BIP44 accounts reject next_address
+    {
+        let bip44_account = wallet
+            .accounts
+            .standard_bip44_accounts
+            .get(&0)
+            .expect("Expected BIP44 account at index 0 to exist");
+        let xpub = bip44_account.account_xpub;
+        let managed_account = managed_wallet_info
+            .first_bip44_managed_account_mut()
+            .expect("Failed to get first BIP44 managed account");
+
+        let result = managed_account.next_address(Some(&xpub), true);
+        assert!(result.is_err(), "Standard BIP44 accounts should reject next_address");
+        assert_eq!(
+            result.expect_err("Expected an error when calling next_address on BIP44 account"),
+            "Standard accounts must use next_receive_address or next_change_address"
+        );
+
+        // But next_receive_address and next_change_address should work
+        assert!(managed_account.next_receive_address(Some(&xpub), true).is_ok());
+        assert!(managed_account.next_change_address(Some(&xpub), true).is_ok());
+    }
+
+    // Test that standard BIP32 accounts reject next_address (if present)
+    if let Some(bip32_account) = wallet.accounts.standard_bip32_accounts.get(&0) {
+        let xpub = bip32_account.account_xpub;
+        if let Some(managed_account) = managed_wallet_info.first_bip32_managed_account_mut() {
+            let result = managed_account.next_address(Some(&xpub), true);
+            assert!(result.is_err(), "Standard BIP32 accounts should reject next_address");
+            assert_eq!(
+                result.expect_err("Expected an error when calling next_address on BIP44 account"),
+                "Standard accounts must use next_receive_address or next_change_address"
+            );
+        }
+    }
+
+    // Test that special accounts accept next_address
+    if let Some(identity_account) = wallet.accounts.identity_registration.as_ref() {
+        let xpub = identity_account.account_xpub;
+        let managed_account = managed_wallet_info
+            .identity_registration_managed_account_mut()
+            .expect("Failed to get identity registration managed account");
+
+        let result = managed_account.next_address(Some(&xpub), true);
+        // This should either succeed or fail with "No unused addresses available"
+        // but NOT with "Standard accounts must use..."
+        if let Err(e) = result {
+            assert_ne!(
+                e, "Standard accounts must use next_receive_address or next_change_address",
+                "Identity registration account should accept next_address method"
+            );
+        }
+    }
+
+    println!("next_address method restrictions are properly enforced");
+}
+
+#[test]
+fn test_coinjoin_transaction_routing() {
+    let tx_type = TransactionType::CoinJoin;
+    let accounts = TransactionRouter::get_relevant_account_types(&tx_type);
+
+    // A CoinJoin tx checks every fund-bearing account, since it can also touch standard funds
+    // (collateral, funding/change). Discovery is membership-based, not gated on the tx shape.
+    assert!(accounts.contains(&AccountTypeToCheck::CoinJoin));
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP44));
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP32));
+    assert!(accounts.contains(&AccountTypeToCheck::DashpayReceivingFunds));
+    assert!(accounts.contains(&AccountTypeToCheck::DashpayExternalAccount));
+}
+
+#[test]
+fn test_asset_lock_transaction_routing() {
+    let tx_type = TransactionType::AssetLock;
+    let accounts = TransactionRouter::get_relevant_account_types(&tx_type);
+
+    // Should check standard accounts and all identity accounts
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP44));
+    assert!(accounts.contains(&AccountTypeToCheck::StandardBIP32));
+    assert!(accounts.contains(&AccountTypeToCheck::IdentityRegistration));
+    assert!(accounts.contains(&AccountTypeToCheck::IdentityTopUp));
+    assert!(accounts.contains(&AccountTypeToCheck::IdentityTopUpNotBound));
+    assert!(accounts.contains(&AccountTypeToCheck::IdentityInvitation));
+}
+
+#[test]
+fn test_ignored_transaction_routing() {
+    let tx_type = TransactionType::Ignored;
+    let accounts = TransactionRouter::get_relevant_account_types(&tx_type);
+
+    assert!(accounts.is_empty());
+}
