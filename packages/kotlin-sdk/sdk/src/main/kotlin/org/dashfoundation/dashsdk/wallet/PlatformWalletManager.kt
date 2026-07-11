@@ -242,6 +242,17 @@ class PlatformWalletManager(
         network = network,
     )
 
+    /**
+     * Identity keys whose private half could not be derived/stored during
+     * persistence (keyed by public-key hex) — the queryable "keys pending"
+     * state of dashpay/platform#4053. Such keys were persisted watch-only
+     * and cannot sign; repair via [repairIdentityKey]. Empty in the healthy
+     * case.
+     */
+    val pendingIdentityKeys:
+        kotlinx.coroutines.flow.StateFlow<Map<String, PlatformWalletPersistenceHandler.PendingIdentityKey>>
+        get() = persistenceHandler.pendingIdentityKeys
+
     /** `MnemonicResolverHandle` for FFI calls that derive from a stored mnemonic. */
     val mnemonicResolverHandle: Long get() = mnemonicResolver.nativeHandle
 
@@ -261,6 +272,12 @@ class PlatformWalletManager(
      * "one allowed exception"); Kotlin only encrypts the returned scalar.
      * Returns the recorded storage identifier (e.g. `privkey.<pubkeyHex>`),
      * or throws on a derivation / storage failure.
+     *
+     * On success the key is dropped from [pendingIdentityKeys] via the
+     * persistence handler: the repair stores the private key directly through
+     * the deriver, bypassing `onPersistIdentityKeyUpsert` (the only persist
+     * path that clears pending), so it must clear the entry itself or the
+     * repaired key would keep showing as pending.
      */
     fun repairIdentityKey(
         walletId: ByteArray,
@@ -270,12 +287,16 @@ class PlatformWalletManager(
     ): String? {
         require(identityIndex >= 0) { "identityIndex must be non-negative, got $identityIndex" }
         require(keyIndex >= 0) { "keyIndex must be non-negative, got $keyIndex" }
-        return identityKeyDeriver.deriveAndStore(
+        val storageIdentifier = identityKeyDeriver.deriveAndStore(
             walletId = walletId,
             publicKeyData = publicKeyData,
             identityIndex = identityIndex,
             keyIndex = keyIndex,
         )
+        if (storageIdentifier != null) {
+            persistenceHandler.markIdentityKeyRepaired(publicKeyData.toHex())
+        }
+        return storageIdentifier
     }
 
     /**

@@ -29,9 +29,10 @@ import javax.crypto.spec.PSource
  * - [MASTER_ALIAS] `org.dashfoundation.wallet.master` — mnemonics and
  *   general wallet secrets, under a non-auth AES-256-GCM key (name parity
  *   with the iOS keychain service `org.dashfoundation.wallet`).
- * - [KEYS_ALIAS] `org.dashfoundation.wallet.keys` — identity private keys,
- *   under an RSA-2048 OAEP(SHA-256) keypair. The PUBLIC key encrypts and is
- *   never auth-gated, so **storing** a key never prompts (parity with iOS,
+ * - [KEYS_ALIAS_AUTH_GATED] `org.dashfoundation.wallet.keys.authgated` —
+ *   identity private keys under the default [KeySecurityPolicy.AUTH_GATED],
+ *   wrapped by an RSA-2048 OAEP(SHA-256) keypair. The PUBLIC key encrypts and
+ *   is never auth-gated, so **storing** a key never prompts (parity with iOS,
  *   which stores identity keys with no access control) — crucially the
  *   persistence callback stores from a Rust Tokio thread holding the
  *   wallet-manager write lock, where a prompt is impossible. The PRIVATE key
@@ -40,21 +41,55 @@ import javax.crypto.spec.PSource
  *   requires auth (the read-with-auth hardening mirrors the iOS seed
  *   policy). A symmetric auth-required key would gate encrypt too and break
  *   those unprompted write paths.
+ * - [KEYS_ALIAS_DEVICE_BOUND] `org.dashfoundation.wallet.keys.devicebound` —
+ *   the [KeySecurityPolicy.DEVICE_BOUND] variant of the identity-keys
+ *   alias: the same RSA-2048 OAEP wrapping pair, but withOUT the
+ *   user-authentication gate on the private key, for host apps that gate
+ *   signing behind their own auth model (see [KeySecurityPolicy]).
+ * - [KEYS_ALIAS] `org.dashfoundation.wallet.keys` — the **legacy** pre-RSA
+ *   alias that wrapped identity keys under an auth-gated AES-256-GCM key.
+ *   Retained read-only so existing installs' AES-GCM blobs stay recoverable:
+ *   [WalletStorage.retrievePrivateKey] decrypts a legacy blob with it and
+ *   migrates the value to [KEYS_ALIAS_AUTH_GATED]. Never written by new keys.
+ *
+ * Which identity-keys alias a manager instance writes/reads is selected by
+ * the [keySecurityPolicy] constructor parameter (default: the historical
+ * [KeySecurityPolicy.AUTH_GATED]) and exposed as [keysAlias].
  *
  * StrongBox is used when available, with a software-Keystore fallback.
+ *
+ * @param keySecurityPolicy security policy for the identity-keys alias.
+ *   Defaults to [KeySecurityPolicy.AUTH_GATED], which preserves the
+ *   historical behavior exactly.
  */
-class KeystoreManager {
+class KeystoreManager(
+    val keySecurityPolicy: KeySecurityPolicy = KeySecurityPolicy.AUTH_GATED,
+) {
+
+    /**
+     * The identity-keys alias this manager targets, per
+     * [keySecurityPolicy]: [KEYS_ALIAS_AUTH_GATED] (auth-gated decrypt) or
+     * [KEYS_ALIAS_DEVICE_BOUND] (non-gated decrypt). [WalletStorage] passes
+     * this to [encrypt]/[decrypt] for identity-key material.
+     */
+    val keysAlias: String
+        get() = when (keySecurityPolicy) {
+            KeySecurityPolicy.AUTH_GATED -> KEYS_ALIAS_AUTH_GATED
+            KeySecurityPolicy.DEVICE_BOUND -> KEYS_ALIAS_DEVICE_BOUND
+        }
 
     /**
      * Encrypt [plaintext] under [alias]; returns (iv, ciphertext).
-     * [MASTER_ALIAS] uses AES-256-GCM (iv is the GCM nonce). [KEYS_ALIAS]
-     * uses the RSA public key (no iv — the blob's iv is empty) and never
-     * requires authentication, so identity-key writes never prompt.
+     * [MASTER_ALIAS] uses AES-256-GCM (iv is the GCM nonce). The RSA
+     * identity-keys aliases ([KEYS_ALIAS_AUTH_GATED] / [KEYS_ALIAS_DEVICE_BOUND])
+     * use the RSA public key (no iv — the blob's iv is empty) and never
+     * require authentication, so identity-key writes never prompt. (The legacy
+     * [KEYS_ALIAS] is never an encrypt target — new keys use the RSA aliases.)
      */
     fun encrypt(plaintext: ByteArray, alias: String = MASTER_ALIAS): EncryptedBlob {
-        if (alias == KEYS_ALIAS) {
+        if (isIdentityKeysAlias(alias)) {
             val cipher = Cipher.getInstance(RSA_TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, keysPublicKey(), oaepSpec())
+            cipher.init(Cipher.ENCRYPT_MODE, keysPublicKey(alias), oaepSpec())
             return EncryptedBlob(iv = ByteArray(0), ciphertext = cipher.doFinal(plaintext))
         }
         val cipher = Cipher.getInstance(AES_TRANSFORMATION)
@@ -64,15 +99,19 @@ class KeystoreManager {
 
     /**
      * Decrypt a blob produced by [encrypt] under the same [alias]. The
-     * [KEYS_ALIAS] RSA private-key decrypt throws
+     * [KEYS_ALIAS_AUTH_GATED] RSA private-key decrypt throws
      * `UserNotAuthenticatedException` when the [AUTH_VALIDITY_SECONDS] auth
      * window is closed — the caller (`KeystoreSigner`) prompts via the
-     * `BiometricGate` and retries.
+     * `BiometricGate` and retries. The [KEYS_ALIAS_DEVICE_BOUND] decrypt is
+     * never auth-gated (see [KeySecurityPolicy.DEVICE_BOUND]). Legacy pre-RSA
+     * AES-GCM blobs are NOT handled here — [WalletStorage.retrievePrivateKey]
+     * detects them ([isLegacyKeysBlob]) and routes them through
+     * [decryptLegacyKeysBlob].
      */
     fun decrypt(blob: EncryptedBlob, alias: String = MASTER_ALIAS): ByteArray {
-        if (alias == KEYS_ALIAS) {
+        if (isIdentityKeysAlias(alias)) {
             val cipher = Cipher.getInstance(RSA_TRANSFORMATION)
-            cipher.init(Cipher.DECRYPT_MODE, keysPrivateKey(), oaepSpec())
+            cipher.init(Cipher.DECRYPT_MODE, keysPrivateKey(alias), oaepSpec())
             return cipher.doFinal(blob.ciphertext)
         }
         val cipher = Cipher.getInstance(AES_TRANSFORMATION)
@@ -85,15 +124,49 @@ class KeystoreManager {
     }
 
     /**
-     * Whether [blob] is structurally a [KEYS_ALIAS] RSA blob the current
+     * Whether [blob] is structurally an RSA identity-keys blob the current
      * scheme can decrypt: no iv (RSA blobs never carry one) and exactly one
-     * RSA block of ciphertext. Blobs written by the pre-RSA AES-GCM scheme
-     * carry a GCM nonce in `iv` and became undecryptable when the AES key
-     * was dropped for the RSA pair — they need a re-derive. Never decrypts,
-     * so it never prompts for authentication.
+     * RSA block of ciphertext. Legacy pre-RSA AES-GCM blobs carry a GCM nonce
+     * in `iv` (see [isLegacyKeysBlob]) and are handled by the migration
+     * fallback instead. Never decrypts, so it never prompts for authentication.
      */
     fun isKeysBlobDecryptable(blob: EncryptedBlob): Boolean =
         blob.iv.isEmpty() && blob.ciphertext.size == RSA_KEY_SIZE / 8
+
+    /**
+     * Whether [blob] is a legacy pre-RSA identity-key blob — one written by the
+     * old scheme that wrapped identity keys under the auth-gated AES-256-GCM key
+     * at [KEYS_ALIAS]. Such blobs carry a GCM nonce in `iv`; the RSA scheme
+     * never does. Structural check only — never decrypts, never prompts.
+     * Decrypt these via [decryptLegacyKeysBlob].
+     */
+    fun isLegacyKeysBlob(blob: EncryptedBlob): Boolean = blob.iv.isNotEmpty()
+
+    /**
+     * Whether the legacy AES key at [KEYS_ALIAS] still exists, so a legacy
+     * identity-key blob is recoverable via [decryptLegacyKeysBlob] (and can be
+     * migrated to the RSA scheme). A Keystore presence check only — no decrypt,
+     * no prompt. False once an older build already deleted the key, in which
+     * case any surviving legacy blob is unrecoverable and needs a re-derive.
+     */
+    fun hasLegacyKeysKey(): Boolean =
+        (androidKeyStore().getKey(KEYS_ALIAS, null) as? SecretKey) != null
+
+    /**
+     * Decrypt a legacy pre-RSA identity-key [blob] with the retained AES-GCM key
+     * at [KEYS_ALIAS], or return `null` if that key is gone (the blob is then
+     * unrecoverable). Deliberately fetches the existing key WITHOUT generating a
+     * fresh one — a new key could never open an old blob. The legacy key was
+     * auth-gated, so this throws `UserNotAuthenticatedException` when the auth
+     * window is closed, exactly as the RSA auth-gated decrypt does; the caller
+     * ([KeystoreSigner]) prompts and retries.
+     */
+    fun decryptLegacyKeysBlob(blob: EncryptedBlob): ByteArray? {
+        val legacyKey = androidKeyStore().getKey(KEYS_ALIAS, null) as? SecretKey ?: return null
+        val cipher = Cipher.getInstance(AES_TRANSFORMATION)
+        cipher.init(Cipher.DECRYPT_MODE, legacyKey, GCMParameterSpec(GCM_TAG_BITS, blob.iv))
+        return cipher.doFinal(blob.ciphertext)
+    }
 
     /** IV + ciphertext pair, serialized as `iv.size || iv || ciphertext`. */
     data class EncryptedBlob(val iv: ByteArray, val ciphertext: ByteArray) {
@@ -154,18 +227,24 @@ class KeystoreManager {
         }
     }
 
-    // ── KEYS_ALIAS: RSA-2048 OAEP keypair (identity private keys) ──
-    // Public key encrypts (never auth-gated → unprompted writes); private key
-    // decrypts under user auth within AUTH_VALIDITY_SECONDS (signing prompts).
+    // ── Identity-keys aliases: RSA-2048 OAEP keypair per alias ──
+    // Public key encrypts (never auth-gated → unprompted writes); the
+    // KEYS_ALIAS_AUTH_GATED private key decrypts under user auth within
+    // AUTH_VALIDITY_SECONDS (signing prompts), while the
+    // KEYS_ALIAS_DEVICE_BOUND private key decrypts without a gate
+    // (KeySecurityPolicy.DEVICE_BOUND).
 
-    private fun keysPublicKey(): PublicKey =
-        androidKeyStore().getCertificate(KEYS_ALIAS)?.publicKey ?: ensureKeysKeyPair().public
+    private fun keysPublicKey(alias: String): PublicKey =
+        androidKeyStore().getCertificate(alias)?.publicKey ?: ensureKeysKeyPair(alias).public
 
-    private fun keysPrivateKey(): PrivateKey =
-        (androidKeyStore().getKey(KEYS_ALIAS, null) as? PrivateKey) ?: ensureKeysKeyPair().private
+    private fun keysPrivateKey(alias: String): PrivateKey =
+        (androidKeyStore().getKey(alias, null) as? PrivateKey) ?: ensureKeysKeyPair(alias).private
 
     /**
-     * Return the RSA [KEYS_ALIAS] keypair, creating it on first use.
+     * Return the RSA identity-keys keypair for [alias], creating it on
+     * first use. The user-authentication gate is applied only to
+     * [KEYS_ALIAS_AUTH_GATED]; [KEYS_ALIAS_DEVICE_BOUND] is generated without
+     * one.
      *
      * Serialized on a process-wide lock (the AndroidKeyStore alias is
      * process-global, and this manager is instantiated per [WalletStorage])
@@ -177,22 +256,26 @@ class KeystoreManager {
      * public key the first already encrypted with, leaving that stored
      * private key undecryptable by the surviving alias.
      */
-    private fun ensureKeysKeyPair(): KeyPair = synchronized(KEYS_ALIAS_LOCK) {
+    private fun ensureKeysKeyPair(alias: String): KeyPair = synchronized(KEYS_ALIAS_LOCK) {
+        val authGated = alias == KEYS_ALIAS_AUTH_GATED
         val keyStore = androidKeyStore()
-        val existingPrivate = keyStore.getKey(KEYS_ALIAS, null) as? PrivateKey
-        val existingCert = keyStore.getCertificate(KEYS_ALIAS)
+        val existingPrivate = keyStore.getKey(alias, null) as? PrivateKey
+        val existingCert = keyStore.getCertificate(alias)
         if (existingPrivate != null && existingCert != null) {
             // A valid RSA pair already exists (possibly just created by a
             // thread that raced us) — reuse it, never delete it.
             return@synchronized KeyPair(existingCert.publicKey, existingPrivate)
         }
-        // Absent, or a stale symmetric entry from an earlier build (which
-        // gated encrypt too and broke unprompted writes) — drop and recreate.
-        runCatching { keyStore.deleteEntry(KEYS_ALIAS) }
+        // Absent, or a partial/wrong-type entry at THIS RSA alias — drop and
+        // recreate. Note [alias] is one of the RSA aliases
+        // ([KEYS_ALIAS_AUTH_GATED] / [KEYS_ALIAS_DEVICE_BOUND]), never the
+        // legacy [KEYS_ALIAS], so the pre-RSA AES key that still wraps existing
+        // installs' identity-key blobs is never deleted here.
+        runCatching { keyStore.deleteEntry(alias) }
 
         fun spec(strongBox: Boolean): KeyGenParameterSpec {
             val builder = KeyGenParameterSpec.Builder(
-                KEYS_ALIAS,
+                alias,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
             )
                 .setKeySize(RSA_KEY_SIZE)
@@ -203,20 +286,23 @@ class KeystoreManager {
                 .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA1)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
                 .setUnlockedDeviceRequired(true)
-                .setUserAuthenticationRequired(true)
-            // setUserAuthenticationParameters is API 30+ (Android 11); on the
-            // minSdk-29 (Android 10) floor fall back to the deprecated pre-30
-            // time-bound API. Pre-30 the key accepts any enrolled authenticator
-            // for the window; the STRONG|DEVICE_CREDENTIAL restriction (and the
-            // AuthPrompt that requests it) still applies on 30+.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.setUserAuthenticationParameters(
-                    AUTH_VALIDITY_SECONDS,
-                    KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                builder.setUserAuthenticationValidityDurationSeconds(AUTH_VALIDITY_SECONDS)
+            if (authGated) {
+                builder.setUserAuthenticationRequired(true)
+                // setUserAuthenticationParameters is API 30+ (Android 11); on
+                // the minSdk-29 (Android 10) floor fall back to the deprecated
+                // pre-30 time-bound API. Pre-30 the key accepts any enrolled
+                // authenticator for the window; the STRONG|DEVICE_CREDENTIAL
+                // restriction (and the AuthPrompt that requests it) still
+                // applies on 30+.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    builder.setUserAuthenticationParameters(
+                        AUTH_VALIDITY_SECONDS,
+                        KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    builder.setUserAuthenticationValidityDurationSeconds(AUTH_VALIDITY_SECONDS)
+                }
             }
             if (strongBox) builder.setIsStrongBoxBacked(true)
             return builder.build()
@@ -246,13 +332,50 @@ class KeystoreManager {
 
     companion object {
         const val MASTER_ALIAS = "org.dashfoundation.wallet.master"
+
+        /**
+         * **Legacy** identity-keys alias from the pre-RSA scheme, where
+         * identity private keys were wrapped under an **auth-gated AES-256-GCM**
+         * key here. Retained (never deleted, never regenerated) purely so
+         * existing installs' AES-GCM blobs stay decryptable across the upgrade
+         * to the RSA scheme: [WalletStorage.retrievePrivateKey] falls back to
+         * this key for a legacy blob and migrates it to [KEYS_ALIAS_AUTH_GATED].
+         * New identity keys are NEVER written here — see [keysAlias].
+         */
         const val KEYS_ALIAS = "org.dashfoundation.wallet.keys"
 
-        /** Auth window for the identity-keys alias, in seconds. */
+        /**
+         * Auth-gated identity-keys alias: the RSA-2048 OAEP wrapping pair for
+         * [KeySecurityPolicy.AUTH_GATED]. A **new** alias distinct from the
+         * legacy [KEYS_ALIAS] so upgrading installs keep their old AES key (and
+         * thus their old blobs) intact instead of having it deleted out from
+         * under them. Fixed Keystore auth parameters also mean it can never
+         * share an alias with [KEYS_ALIAS_DEVICE_BOUND].
+         */
+        const val KEYS_ALIAS_AUTH_GATED = "org.dashfoundation.wallet.keys.authgated"
+
+        /**
+         * Non-auth-gated identity-keys alias, selected by
+         * [KeySecurityPolicy.DEVICE_BOUND]. Distinct from the other identity
+         * aliases because Keystore auth parameters are fixed at generation — the
+         * two policies can never share one alias.
+         */
+        const val KEYS_ALIAS_DEVICE_BOUND = "org.dashfoundation.wallet.keys.devicebound"
+
+        /** Auth window for the auth-gated identity-keys alias, in seconds. */
         const val AUTH_VALIDITY_SECONDS = 30
 
+        /**
+         * Whether [alias] is one of the RSA-wrapped identity-keys aliases new
+         * keys are written under. The legacy [KEYS_ALIAS] (AES-GCM) is
+         * deliberately excluded — it is read-only, reached only via the
+         * migration fallback, never through the RSA encrypt/decrypt path.
+         */
+        fun isIdentityKeysAlias(alias: String): Boolean =
+            alias == KEYS_ALIAS_AUTH_GATED || alias == KEYS_ALIAS_DEVICE_BOUND
+
         // Guards first-use creation/migration of the process-global
-        // KEYS_ALIAS entry across concurrent callers (and across the
+        // identity-keys entries across concurrent callers (and across the
         // per-WalletStorage KeystoreManager instances).
         private val KEYS_ALIAS_LOCK = Any()
 

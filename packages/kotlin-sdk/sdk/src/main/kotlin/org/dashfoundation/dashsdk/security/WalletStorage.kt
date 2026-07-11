@@ -22,14 +22,34 @@ private val Context.secretsStore: DataStore<Preferences> by preferencesDataStore
  * keys, stored base64 in a dedicated Preferences DataStore.
  * Key layout mirrors the iOS account naming:
  * - `mnemonic.<walletIdHex>` — wallet mnemonics (master alias, AES-GCM)
- * - `privkey.<pubkeyHex>` — identity private keys (keys alias: RSA
- *   public-key encrypt / auth-gated private-key decrypt)
+ * - `privkey.<pubkeyHex>` — identity private keys (the [keystore]'s
+ *   [KeystoreManager.keysAlias]: RSA public-key encrypt / private-key
+ *   decrypt that is auth-gated or not per the keystore's
+ *   [KeySecurityPolicy])
+ *
+ * The identity-key security policy is fixed by the [keystore] this storage
+ * wraps; use the policy-taking constructor to opt into
+ * [KeySecurityPolicy.DEVICE_BOUND] (see [KeySecurityPolicy] for the
+ * semantics and the stability requirement). The default is the historical
+ * [KeySecurityPolicy.AUTH_GATED] behavior, unchanged.
  */
 class WalletStorage(
     context: Context,
     private val keystore: KeystoreManager = KeystoreManager(),
 ) {
+    /**
+     * Construct with an explicit identity-key [keySecurityPolicy] —
+     * convenience for host apps that don't otherwise need to touch
+     * [KeystoreManager]. `WalletStorage(context)` keeps the
+     * [KeySecurityPolicy.AUTH_GATED] default.
+     */
+    constructor(context: Context, keySecurityPolicy: KeySecurityPolicy) :
+        this(context, KeystoreManager(keySecurityPolicy))
+
     private val store = context.secretsStore
+
+    /** The identity-key security policy this storage was constructed with. */
+    val keySecurityPolicy: KeySecurityPolicy get() = keystore.keySecurityPolicy
 
     // ── Mnemonics ─────────────────────────────────────────────────────
 
@@ -87,29 +107,56 @@ class WalletStorage(
 
     /**
      * Store raw private-key bytes for [pubkeyHex], encrypted with the
-     * [KeystoreManager.KEYS_ALIAS] RSA public key. Public-key encrypt is
-     * never auth-gated, so this never prompts and never throws
-     * `UserNotAuthenticatedException` — matching iOS's silent identity-key
-     * write, and letting the persistence callback (which runs on a Rust
-     * Tokio thread under the wallet-manager write lock, where a prompt is
-     * impossible) store keys. Per the CLAUDE.md doctrine this is the one
-     * allowed Kotlin-side persistence of key material: Rust derives, we
-     * encrypt. Reads ([retrievePrivateKey]) still require auth.
+     * [KeystoreManager.keysAlias] RSA public key. Public-key encrypt is
+     * never auth-gated (under either [KeySecurityPolicy]), so this never
+     * prompts and never throws `UserNotAuthenticatedException` — matching
+     * iOS's silent identity-key write, and letting the persistence callback
+     * (which runs on a Rust Tokio thread under the wallet-manager write
+     * lock, where a prompt is impossible) store keys. Per the CLAUDE.md
+     * doctrine this is the one allowed Kotlin-side persistence of key
+     * material: Rust derives, we encrypt. Reads ([retrievePrivateKey])
+     * require auth only under [KeySecurityPolicy.AUTH_GATED].
      */
     suspend fun storePrivateKey(pubkeyHex: String, privateKey: ByteArray) {
-        val blob = keystore.encrypt(privateKey, alias = KeystoreManager.KEYS_ALIAS)
+        val blob = keystore.encrypt(privateKey, alias = keystore.keysAlias)
         store.edit { it[privateKeyKey(pubkeyHex)] = encode(blob) }
     }
 
     /**
-     * Decrypt the private key for [pubkeyHex]. Throws
+     * Decrypt the private key for [pubkeyHex]. Under
+     * [KeySecurityPolicy.AUTH_GATED] this throws
      * `UserNotAuthenticatedException` when the auth window expired — the
-     * caller (KeystoreSigner) routes through [BiometricGate] and retries.
+     * caller (KeystoreSigner) routes through [BiometricGate] and retries;
+     * under [KeySecurityPolicy.DEVICE_BOUND] it never auth-gates.
      * Callers must zero the returned array after use.
+     *
+     * Upgrade path: a blob written by the pre-RSA scheme (AES-GCM under the
+     * legacy [KeystoreManager.KEYS_ALIAS], never deleted) is decrypted with
+     * that retained key and then transparently re-encrypted under the current
+     * RSA alias and rewritten, so it is recovered — not stranded — and future
+     * reads use the new scheme. A fresh install has no legacy blobs and always
+     * takes the RSA path.
      */
     suspend fun retrievePrivateKey(pubkeyHex: String): ByteArray? {
         val encoded = store.data.first()[privateKeyKey(pubkeyHex)] ?: return null
-        return keystore.decrypt(decode(encoded), alias = KeystoreManager.KEYS_ALIAS)
+        val blob = decode(encoded)
+        if (keystore.isLegacyKeysBlob(blob)) {
+            // Legacy AES-GCM blob: recover with the retained legacy key (may
+            // throw UserNotAuthenticatedException — the legacy key was
+            // auth-gated — which the signer handles exactly as the RSA path),
+            // or null if that key is already gone (unrecoverable).
+            val plain = keystore.decryptLegacyKeysBlob(blob) ?: return null
+            // Opportunistically migrate to the RSA scheme. A rewrite failure
+            // must not lose the value we just recovered, so it stays best-effort
+            // and the read still returns the plaintext (migration retries next
+            // read).
+            runCatching {
+                val migrated = keystore.encrypt(plain, alias = keystore.keysAlias)
+                store.edit { it[privateKeyKey(pubkeyHex)] = encode(migrated) }
+            }
+            return plain
+        }
+        return keystore.decrypt(blob, alias = keystore.keysAlias)
     }
 
     suspend fun deletePrivateKey(pubkeyHex: String) {
@@ -120,16 +167,19 @@ class WalletStorage(
         store.data.first().contains(privateKeyKey(pubkeyHex))
 
     /**
-     * Whether the blob stored for [pubkeyHex] is decryptable under the
-     * current [KeystoreManager.KEYS_ALIAS] RSA scheme. Blobs written by the
-     * pre-RSA AES-GCM scheme survive in the DataStore but lost their key
-     * when the RSA pair replaced it, so signing with them can only fail —
-     * key-health treats them as missing and offers a re-derive. Structural
-     * check only: never decrypts, never prompts.
+     * Whether the blob stored for [pubkeyHex] can be recovered: either it is a
+     * current-scheme RSA blob, or it is a legacy pre-RSA AES-GCM blob whose
+     * retained legacy key still exists (so [retrievePrivateKey] can decrypt and
+     * migrate it). Only a legacy blob whose key was already deleted by an older
+     * build is unrecoverable — key-health treats that as missing and offers a
+     * re-derive. Structural + Keystore-presence check only: never decrypts,
+     * never prompts.
      */
     suspend fun isPrivateKeyDecryptable(pubkeyHex: String): Boolean {
         val encoded = store.data.first()[privateKeyKey(pubkeyHex)] ?: return false
-        return keystore.isKeysBlobDecryptable(decode(encoded))
+        val blob = decode(encoded)
+        return keystore.isKeysBlobDecryptable(blob) ||
+            (keystore.isLegacyKeysBlob(blob) && keystore.hasLegacyKeysKey())
     }
 
     /** All entry names (masked listing for the Keystore Explorer screen). */
