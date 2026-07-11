@@ -5222,6 +5222,7 @@ version = "4.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bincode",
  "bs58",
  "cbindgen 0.27.0",
