@@ -19,7 +19,8 @@ pub use dip14::{
     derive_contact_xpub, unmask_account_reference, ContactXpubData, DEFAULT_CONTACT_GAP_LIMIT,
 };
 pub use tx_metadata::{
-    derive_tx_metadata_key, open_tx_metadata, seal_tx_metadata, OpenedTxMetadata,
+    derive_tx_metadata_key, derive_tx_metadata_key_from_master, open_tx_metadata,
+    seal_tx_metadata, tx_metadata_derivation_path, OpenedTxMetadata,
     TX_METADATA_ENCRYPTION_CHILD, VERSION_CBOR, VERSION_PROTOBUF,
 };
 pub use validation::pubkey_binds_expected_key_data;
