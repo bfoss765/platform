@@ -153,11 +153,18 @@ class DocumentTransactions internal constructor() {
      * @param version payload version byte (`1` = protobuf, as the wallet writes).
      * @param payload already-serialized opaque plaintext; the SDK does not
      *   parse it.
+     * [mnemonicResolverHandle] is the host mnemonic-resolver handle
+     * ([org.dashfoundation.dashsdk.wallet.PlatformWalletManager.mnemonicResolverHandle]):
+     * required for external-signable wallets (the app's shape — the AES key
+     * derives on demand through the resolver), ignored for wallets with
+     * resident private keys.
+     *
      * @return the confirmed document's canonical JSON (its 32-byte id is the
      *   base58 `$id` field).
      */
     suspend fun createEncryptedDocument(
         walletHandle: Long,
+        mnemonicResolverHandle: Long,
         ownerId: ByteArray,
         contractId: ByteArray,
         documentType: String,
@@ -175,6 +182,7 @@ class DocumentTransactions internal constructor() {
         mapNativeErrors {
             TransactionsNative.documentCreateEncrypted(
                 walletHandle,
+                mnemonicResolverHandle,
                 ownerId,
                 contractId,
                 documentType,
@@ -202,9 +210,16 @@ class DocumentTransactions internal constructor() {
      *   parses each `payload` itself (a protobuf `TxMetadataBatch` for
      *   `version == 1`) and reconciles memo / taxCategory / exchangeRate /
      *   service / giftCard fields into its local store.
+     *
+     * [mnemonicResolverHandle] is the host mnemonic-resolver handle
+     * ([org.dashfoundation.dashsdk.wallet.PlatformWalletManager.mnemonicResolverHandle]):
+     * required for external-signable wallets (the app's shape — the AES key
+     * derives on demand through the resolver), ignored for wallets with
+     * resident private keys.
      */
     suspend fun fetchEncryptedDocuments(
         walletHandle: Long,
+        mnemonicResolverHandle: Long,
         ownerId: ByteArray,
         contractId: ByteArray,
         documentType: String,
@@ -216,6 +231,7 @@ class DocumentTransactions internal constructor() {
         mapNativeErrors {
             TransactionsNative.documentFetchEncrypted(
                 walletHandle,
+                mnemonicResolverHandle,
                 ownerId,
                 contractId,
                 documentType,

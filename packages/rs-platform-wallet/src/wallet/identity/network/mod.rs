@@ -62,7 +62,9 @@ mod seed_binding;
 mod tokens;
 
 pub use contact_info::ContactInfoPublishOutcome;
-pub use encrypted_document::{query_owned_encrypted_documents, DecryptedEncryptedDocument};
+pub use encrypted_document::{
+    query_owned_encrypted_documents, DecryptedEncryptedDocument, TxMetadataKeySource,
+};
 pub use contact_requests::{
     AutoAcceptProofSource, ContactCryptoProvider, ContactInfoOpened, ContactInfoSealed,
 };
