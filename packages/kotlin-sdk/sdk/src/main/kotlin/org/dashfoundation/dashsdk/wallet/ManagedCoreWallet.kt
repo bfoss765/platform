@@ -39,6 +39,26 @@ class ManagedCoreWallet internal constructor(handle: Long) : AutoCloseable {
             tx.accountIndex,
         )
 
+    /**
+     * Build + sign a standard L1 payment funded from the UNION of the wallet's
+     * signable funds accounts, WITHOUT broadcasting. Returns the packed native
+     * result (`u64 fee, u64 change,` then the signed tx bytes, big-endian) —
+     * decoded by [ManagedPlatformWallet.buildSignedPayment]. See that method
+     * for the full contract; drive this through it (it serializes concurrent
+     * builds), not directly.
+     */
+    internal fun buildSignedPayment(
+        outputsBlob: ByteArray,
+        feePerKb: Long,
+        coreSignerHandle: Long,
+    ): ByteArray =
+        WalletManagerNative.coreWalletBuildSignedPayment(
+            handle,
+            outputsBlob,
+            feePerKb,
+            coreSignerHandle,
+        )
+
     override fun close() {
         cleanable.clean()
     }

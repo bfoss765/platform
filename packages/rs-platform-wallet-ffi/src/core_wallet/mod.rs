@@ -4,10 +4,12 @@
 
 mod addresses;
 mod broadcast;
+mod send;
 mod transaction_builder;
 mod wallet;
 
 pub use addresses::*;
 pub use broadcast::*;
+pub use send::*;
 pub use transaction_builder::*;
 pub use wallet::*;
