@@ -40,13 +40,7 @@ pub const DEFAULT_INTERNAL_GAP_LIMIT: u32 = 30;
 /// per account instead of ~60. BIP158 filter matching is a set intersection,
 /// so the extra scripts add negligible per-block work; the derivation is a
 /// one-time keychain expansion.
-///
-/// EXPERIMENT (temporary, integration branch only): value forced to 30 to
-/// isolate whether the #846/#873 committed-range re-scan fix alone delivers
-/// correct discovery of a heavy CoinJoin wallet at the small gap. Upstream
-/// default remains 100 (rust-dashcore#868); roll back to 100 after the
-/// on-device test.
-pub const DEFAULT_COINJOIN_GAP_LIMIT: u32 = 30;
+pub const DEFAULT_COINJOIN_GAP_LIMIT: u32 = 100;
 
 /// Standard gap limit for special purpose keys (identity, provider keys)
 pub const DEFAULT_SPECIAL_GAP_LIMIT: u32 = 5;
