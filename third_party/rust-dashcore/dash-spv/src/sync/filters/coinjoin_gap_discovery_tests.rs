@@ -12,20 +12,19 @@
 //! `rescan_batch` now re-queues already-processed blocks of ACTIVE batches
 //! against newly derived scripts, to a fixpoint.
 //!
-//! These tests pin all three recovery shapes as regression guards:
+//! These tests pin both the fixed behaviour and the remaining hole:
 //!
 //! 1. [`coinjoin_gap_limit_dense_same_batch_recovers`] — the empirical
-//!    stall-at-59 shape (two dense blocks in one batch). GREEN since #820.
+//!    stall-at-59 shape (two dense blocks in one batch). GREEN since #820;
+//!    kept as a regression guard.
 //! 2. [`coinjoin_gap_limit_inversion_within_batch_recovers`] — a gap-window
 //!    output in an EARLIER block of the SAME (still-active) batch is
 //!    recovered by the commit-time rescan. GREEN since #820.
 //! 3. [`coinjoin_gap_limit_stall_across_committed_batch`] — the SAME shape
-//!    with the earlier block in an already-COMMITTED batch. Formerly RED
-//!    (the residual `(wallet, block-progress)` vs `(wallet, script)` keying
-//!    defect, #846): rescans only reached `active_batches`, so committed
-//!    ranges were permanently out of reach. GREEN since the #846 fix —
-//!    commit-time filter retention + `drain_committed_rescans` give newly
-//!    derived scripts backward reach across the commit boundary.
+//!    with the earlier block in an already-COMMITTED batch (#846): rescans
+//!    only reach `active_batches`, and committed batches are gone. GREEN
+//!    since `rescan_committed_range` re-tests newly derived scripts against
+//!    the STORED filters below the committing batch.
 //!
 //! Each test drives the manager exactly the way the production event loop
 //! does: `try_process_batch` → `BlocksNeeded` → (blocks-manager stand-in)
@@ -311,24 +310,25 @@ async fn coinjoin_gap_limit_inversion_within_batch_recovers() {
     );
 }
 
-/// Regression guard for #846: gap-window outputs in an already-COMMITTED
-/// batch are recovered by the committed-range re-scan.
+/// Gap-window outputs in an already-COMMITTED batch (#846).
 ///
 /// Same funding shape as the within-batch inversion test, but the early
 /// block (indices 40..=51, height 10) sits in batch 0..=99 while the
 /// in-window block (indices 0..=29) sits at height 110 in batch 100..=199.
 /// Batch 0 scans clean (nothing watched matches) and commits. Processing the
 /// height-110 block derives 30..=59, and those scripts DO match block 10's
-/// filter. Pre-fix this stalled forever: `rescan_batch` only reached
-/// `active_batches`, and committed batches were gone (`try_commit_batches`
-/// removed them; the tracker pruned at-or-below the committed height), so
-/// indices 40..=51 — squarely inside the BIP-44/CoinJoin gap-limit recovery
-/// contract (40 < 29 + 1 + 30) — stayed invisible along with their funds,
-/// deterministically, even on a fresh re-sync from genesis.
+/// filter — but `rescan_batch` only reaches `active_batches`, and committed
+/// batches are gone (`try_commit_batches` removes them; the tracker prunes
+/// at-or-below the committed height). Indices 40..=51 — squarely inside the
+/// BIP-44/CoinJoin gap-limit recovery contract (40 < 29 + 1 + 30) — used to
+/// stay invisible forever, along with their funds; a fresh re-sync from
+/// genesis hit the same wall deterministically.
 ///
-/// Now GREEN: commit-time filter retention + `drain_committed_rescans`
-/// re-tests newly derived scripts against the retained committed range and
-/// re-queues matched blocks, so `highest_used` reaches 51.
+/// GREEN since `rescan_committed_range`: newly derived scripts are re-tested
+/// against the persisted filters below the committing batch (BIP-158 filters
+/// are address-independent, so re-matching needs no re-download), and hits
+/// flow through the `track_for_new_scripts` re-download path to the same
+/// commit-time fixpoint. `highest_used` reaches 51.
 #[tokio::test]
 async fn coinjoin_gap_limit_stall_across_committed_batch() {
     let (mut manager, wallet, wallet_id) = setup().await;
@@ -336,6 +336,33 @@ async fn coinjoin_gap_limit_stall_across_committed_batch() {
 
     let (block_a, filter_a, key_a) = block_paying(10, &addresses[40..=51]);
     let (block_b, filter_b, key_b) = block_paying(110, &addresses[0..=29]);
+
+    // Uphold the production invariant the injected batches imply: every
+    // height at or below `stored_height` has its header and filter
+    // persisted (store_and_match_batches stores a batch's filters before
+    // stored_height advances past it). The committed-range recovery path
+    // re-tests exactly this stored data, so the invariant is load-bearing
+    // here: batch 0 commits before block B's processing derives the missing
+    // scripts, and by then its in-memory filters are gone.
+    {
+        let mut header_storage = manager.header_storage.write().await;
+        let mut filter_storage = manager.filter_storage.write().await;
+        for height in 0..=99u32 {
+            let (header, filter_bytes) = if height == 10 {
+                (block_a.header, filter_a.content.clone())
+            } else {
+                let filler = Block::dummy(height, vec![]);
+                let filter = BlockFilter::dummy(&filler);
+                (filler.header, filter.content)
+            };
+            header_storage
+                .store_headers_at_height(&[header.into()], height)
+                .await
+                .expect("seed header");
+            filter_storage.store_filter(height, &filter_bytes).await.expect("seed filter");
+        }
+    }
+
     let blocks: HashMap<BlockHash, Block> =
         HashMap::from([(block_a.block_hash(), block_a), (block_b.block_hash(), block_b)]);
 
@@ -363,11 +390,14 @@ async fn coinjoin_gap_limit_stall_across_committed_batch() {
         highest_used,
         Some(51),
         "CoinJoin External indices 40..=51 were funded at height 10 in a batch that \
-         committed before their scripts were derived; the #846 committed-range re-scan \
-         (retained committed filters + drain_committed_rescans) must recover them. \
-         A stall here (highest_used={highest_used:?}, used_count={used_count}, \
-         highest_generated={highest_generated:?}) means the re-scan is again keyed by \
-         block/commit progress instead of (wallet, script) and the pre-fix silent \
-         fund-loss defect has regressed."
+         committed before their scripts were derived, and the new-script rescan never \
+         looks below the committed boundary (rescan_batch only reaches active_batches; \
+         BlockMatchTracker/commit pruning drops the range). The addresses are within \
+         the gap-limit recovery contract and are watched now (highest_generated = \
+         {highest_generated:?}), yet their outputs stay invisible: highest_used stalls \
+         at {highest_used:?}, used_count={used_count}. Fix direction: key re-scan \
+         suppression by (wallet, address/script) instead of block/commit progress, or \
+         trigger a below-committed-height rescan for a wallet whose gap maintenance \
+         derives scripts mid-sync."
     );
 }

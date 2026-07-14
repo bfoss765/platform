@@ -32,6 +32,12 @@ pub(super) struct FiltersBatch {
     /// need rescan, attributed per wallet so we can rerun matching only
     /// against the wallet that produced each new script.
     collected_scripts: HashMap<WalletId, HashSet<ScriptBuf>>,
+    /// Scripts already forward-rescanned but still awaiting the one combined
+    /// backward sweep over the committed range (#846). Accumulated across
+    /// fixpoint rounds so each script crosses the stored history exactly
+    /// once, instead of the whole history being reloaded per derivation
+    /// round.
+    backward_scripts: HashMap<WalletId, HashSet<ScriptBuf>>,
 }
 
 impl FiltersBatch {
@@ -51,6 +57,7 @@ impl FiltersBatch {
             rescan_complete: false,
             scanned_wallets: BTreeSet::new(),
             collected_scripts: HashMap::new(),
+            backward_scripts: HashMap::new(),
         }
     }
     /// Start height of this batch (inclusive).
@@ -68,12 +75,6 @@ impl FiltersBatch {
     /// Mutable reference to the loaded filters map of this batch.
     pub(super) fn filters_mut(&mut self) -> &mut HashMap<FilterMatchKey, BlockFilter> {
         &mut self.filters
-    }
-    /// Take the loaded filters out of this batch, leaving it empty. Used at
-    /// commit to move a committed batch's filters into the manager's retained
-    /// committed-filter set without cloning.
-    pub(super) fn take_filters(&mut self) -> HashMap<FilterMatchKey, BlockFilter> {
-        std::mem::take(&mut self.filters)
     }
     /// Returns whether this batch is verified (filters verified against their headers).
     pub(super) fn verified(&self) -> bool {
@@ -123,6 +124,21 @@ impl FiltersBatch {
     /// Take collected per-wallet scripts for rescan, leaving the map empty.
     pub(super) fn take_collected_scripts(&mut self) -> HashMap<WalletId, HashSet<ScriptBuf>> {
         std::mem::take(&mut self.collected_scripts)
+    }
+    /// Queue already forward-rescanned scripts for the deferred backward
+    /// sweep over the committed range.
+    pub(super) fn accumulate_backward_scripts(
+        &mut self,
+        scripts: HashMap<WalletId, HashSet<ScriptBuf>>,
+    ) {
+        for (wallet_id, scripts) in scripts {
+            self.backward_scripts.entry(wallet_id).or_default().extend(scripts);
+        }
+    }
+    /// Take the scripts accumulated for the backward sweep, leaving the map
+    /// empty.
+    pub(super) fn take_backward_scripts(&mut self) -> HashMap<WalletId, HashSet<ScriptBuf>> {
+        std::mem::take(&mut self.backward_scripts)
     }
     /// Record the set of wallets that were behind for this batch at scan time.
     pub(super) fn set_scanned_wallets(&mut self, wallets: BTreeSet<WalletId>) {

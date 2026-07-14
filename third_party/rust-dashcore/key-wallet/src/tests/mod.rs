@@ -20,6 +20,8 @@ mod keep_finalized_transactions_tests;
 
 mod managed_account_collection_tests;
 
+mod late_account_finality_boundary_test;
+
 mod performance_tests;
 
 mod special_transaction_matching_tests;
@@ -27,6 +29,12 @@ mod special_transaction_matching_tests;
 mod special_transaction_tests;
 
 mod transaction_tests;
+
+mod observed_spent_outpoints_tests;
+
+mod async_chainlock_prune_race_test;
+
+mod net_amount_source_of_truth_test;
 
 mod spent_outpoints_tests;
 

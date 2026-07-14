@@ -357,6 +357,10 @@ impl filters::FilterStorage for DiskStorageManager {
         self.filters.read().await.filter_tip_height().await
     }
 
+    async fn filter_start_height(&self) -> Option<u32> {
+        self.filters.read().await.filter_start_height().await
+    }
+
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
         self.filters.write().await.truncate_above(target_height).await
     }

@@ -18,29 +18,29 @@ pub const DEFAULT_INTERNAL_GAP_LIMIT: u32 = 30;
 
 /// Standard gap limit for CoinJoin addresses.
 ///
-/// Set to match dashj's `DeterministicKeyChain` lookahead
-/// (`DEFAULT_LOOKAHEAD_SIZE = 100`), which is the effective discovery window
-/// dashj-core (the reference wallet, `org.dashj:dashj-core:22.x`) watches for
-/// CoinJoin keychains. Address discovery here is dynamic — the pool watches
-/// `highest_used + gap_limit` addresses — so this bounds the largest run of
-/// UNUSED CoinJoin addresses the wallet can bridge during a filter/rescan
-/// before discovery stalls.
+/// EXPERIMENT (rust-dashcore #866 + #851, gap-30): deliberately set to 30 —
+/// NOT the dashj-parity 100 (#868) — to test on-device whether hash's rescan
+/// fixes make the narrower gap viable on the heaviest wallet.
 ///
-/// The previous value of 30 starved heavy mixers: DIP-9 CoinJoin mixing
-/// sprays denominations across many sequential addresses, and a gap wider
-/// than 30 unused addresses caused the SDK to stop discovering — it then
-/// missed both the txs that CREATED far-index UTXOs and the txs that SPENT
-/// nearer ones (one skipped block, both directions), leaving a persistent
-/// balance mismatch vs dashj that survived a clean re-creation + full rescan
-/// (dashpay/platform#4073, dashpay/dash-wallet#1507). 100 restores parity
-/// with dashj's window so the SDK discovers every CoinJoin tx dashj does.
+/// Background: gap 30 previously starved heavy mixers. DIP-9 CoinJoin mixing
+/// sprays denominations across many sequential addresses, and a run wider than
+/// 30 unused CoinJoin addresses made the SDK stop discovering — it missed both
+/// the txs that CREATED far-index UTXOs and the txs that SPENT nearer ones,
+/// leaving a persistent balance mismatch vs dashj that survived a clean
+/// re-creation + full rescan (dashpay/platform#4073, dashpay/dash-wallet#1507).
+/// Widening to 100 (dashj `DEFAULT_LOOKAHEAD_SIZE`) restored parity.
 ///
-/// Cost is modest: the CoinJoin account watches two pools (external +
-/// internal), so this pre-derives and filter-matches ~200 CoinJoin addresses
-/// per account instead of ~60. BIP158 filter matching is a set intersection,
-/// so the extra scripts add negligible per-block work; the derivation is a
-/// one-time keychain expansion.
-pub const DEFAULT_COINJOIN_GAP_LIMIT: u32 = 100;
+/// The hypothesis under test here is that #866's committed-range rescan
+/// (`rescan_committed_range`: newly derived scripts are re-tested against the
+/// already-committed filter range) plus #851's out-of-order spend fix (#649)
+/// let gap 30 recover the same CoinJoin history dashj does — because late
+/// gap-window derivations now reach back across the commit boundary instead of
+/// requiring the window itself to be wide enough. If the on-device verdict is
+/// positive, 30 stays; if not, this reverts to 100. Address discovery is
+/// dynamic (the pool watches `highest_used + gap_limit`), so this bounds the
+/// largest run of UNUSED CoinJoin addresses the wallet bridges before a rescan
+/// re-opens discovery.
+pub const DEFAULT_COINJOIN_GAP_LIMIT: u32 = 30;
 
 /// Standard gap limit for special purpose keys (identity, provider keys)
 pub const DEFAULT_SPECIAL_GAP_LIMIT: u32 = 5;
@@ -365,6 +365,16 @@ impl Default for GapLimitManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EXPERIMENT (866+851 gap-30): pins the compiled CoinJoin gap-limit value.
+    /// This build deliberately runs the narrower gap of 30 (not the dashj-parity
+    /// 100 from #868) to test on-device whether hash's #866+#851 fixes make
+    /// gap-30 viable on the heaviest wallet. If this assertion fails, someone
+    /// changed the constant and the experiment's premise no longer holds.
+    #[test]
+    fn coinjoin_gap_limit_pinned_at_30_for_experiment() {
+        assert_eq!(DEFAULT_COINJOIN_GAP_LIMIT, 30);
+    }
 
     #[test]
     fn test_gap_limit_basic() {

@@ -1838,15 +1838,18 @@ mod tests {
 
     /// Heavy-mixer CoinJoin discovery (dashpay/dash-wallet#1507): the CoinJoin
     /// account's default gap limit must watch a discovery window wide enough to
-    /// bridge the address gaps a heavy mixer leaves — matched to dashj's
-    /// ~100-key lookahead. Index 50 is beyond the OLD 30-address window; a fresh
-    /// account must pre-generate it (so the BIP158 filter watches it) and
-    /// recognize a tx paying it. On the old gap of 30 the address was never
-    /// watched, so txs at far CoinJoin indices were skipped entirely — the
-    /// starvation that survived a clean re-creation + full rescan, missing both
-    /// the txs that created far-index UTXOs and the txs that spent nearer ones.
+    /// bridge the address gaps a heavy mixer leaves. This test pins its
+    /// `far_index` to the top edge of that window (`DEFAULT_COINJOIN_GAP_LIMIT
+    /// - 1`) rather than a literal, so it stays a valid regression check at any
+    /// configured gap: a fresh account must pre-generate the far-edge address
+    /// (so the BIP158 filter watches it) and recognize a tx paying it. If the
+    /// address at the far edge were never watched, txs at far CoinJoin indices
+    /// would be skipped entirely — the starvation that survived a clean
+    /// re-creation + full rescan, missing both the txs that created far-index
+    /// UTXOs and the txs that spent nearer ones.
     #[tokio::test]
     async fn coinjoin_gap_limit_discovers_addresses_beyond_the_old_window() {
+        use key_wallet::gap_limit::DEFAULT_COINJOIN_GAP_LIMIT;
         use key_wallet::managed_account::address_pool::AddressPoolType;
         use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
         use key_wallet::transaction_checking::{
@@ -1857,8 +1860,8 @@ mod tests {
         let (wallet_manager, wallet_id, _signer) =
             crate::test_support::split_funded_wallet_manager_many_coinjoin(9_000_000, &[]).await;
 
-        // `far_index` sits past the old 30-address gap but within dashj's window.
-        let far_index: u32 = 50;
+        // `far_index` sits at the top edge of the CoinJoin gap window.
+        let far_index: u32 = DEFAULT_COINJOIN_GAP_LIMIT - 1;
         let far_address = {
             let wm = wallet_manager.read().await;
             let (_, info) = wm.get_wallet_and_info(&wallet_id).expect("wallet present");
@@ -1870,8 +1873,8 @@ mod tests {
                 .expect("coinjoin account 0");
             assert_eq!(
                 cj.gap_limit(),
-                Some(100),
-                "CoinJoin gap limit must match dashj's lookahead (100)"
+                Some(DEFAULT_COINJOIN_GAP_LIMIT),
+                "CoinJoin gap limit must match DEFAULT_COINJOIN_GAP_LIMIT"
             );
             let external = cj
                 .managed_account_type()
@@ -1879,12 +1882,11 @@ mod tests {
                 .into_iter()
                 .find(|p| p.pool_type == AddressPoolType::External)
                 .expect("external CoinJoin pool");
-            // The load-bearing assertion: index 50 is pre-generated (and thus
-            // filter-watched) ONLY because the gap was widened. On the old gap
-            // of 30 this is `None` and the address below can't be fetched.
-            external
-                .address_at_index(far_index)
-                .expect("index 50 must be pre-generated with the widened CoinJoin gap")
+            // The load-bearing assertion: the far-edge index is pre-generated
+            // (and thus filter-watched) because of the configured gap window.
+            external.address_at_index(far_index).expect(
+                "far-edge index must be pre-generated within the CoinJoin gap window",
+            )
         };
 
         // A tx paying the far-index CoinJoin address must be discovered and its
@@ -1927,6 +1929,20 @@ mod tests {
         assert!(
             cj.utxos.values().any(|u| u.txout.value == 12_345_678),
             "the far-index CoinJoin UTXO must be tracked after discovery"
+        );
+    }
+
+    /// EXPERIMENT guard (integration branch): the vendored key-wallet CoinJoin
+    /// gap is forced to 30 to test on-device whether hash's #866 committed-range
+    /// rescan + #851 out-of-order spend fix make gap-30 viable on the heaviest
+    /// wallet. This asserts the effective constant the AAR is built against is
+    /// really 30 (upstream default is 100, rust-dashcore#868).
+    #[test]
+    fn coinjoin_gap_limit_is_experiment_value_30() {
+        assert_eq!(
+            key_wallet::gap_limit::DEFAULT_COINJOIN_GAP_LIMIT,
+            30,
+            "EXPERIMENT expects the vendored CoinJoin gap to be 30"
         );
     }
 }

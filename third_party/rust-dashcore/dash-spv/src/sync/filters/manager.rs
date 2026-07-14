@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use dashcore::bip158::{BlockFilter, FilterQuery};
-use dashcore::{BlockHash, ScriptBuf};
+use dashcore::ScriptBuf;
 
 use super::batch::FiltersBatch;
 use super::block_match_tracker::{BlockMatchTracker, BlockTrackResult};
@@ -44,34 +44,6 @@ struct WalletScanState {
 
 /// Maximum number of batches to scan ahead while waiting for blocks.
 const MAX_LOOKAHEAD_BATCHES: usize = 3;
-
-/// Sliding window of filters retained from committed batches for the #846
-/// committed-range re-test, capping both retained memory and how far back the
-/// re-test reaches. Committed filters are *moved* out of the batch on commit
-/// (no clone), so the common no-new-scripts path is untouched; this bounds only
-/// the CoinJoin-style path where gap-limit maintenance derives scripts
-/// mid-sync. When exceeded, the lowest committed heights are evicted first, so
-/// an index↔height inversion spanning more than this many blocks is not
-/// recovered by the in-memory path (a birth-height rescan remains the backstop;
-/// see `drain_committed_rescans`). At ~5000 heights/batch this keeps roughly the
-/// last four committed batches — far beyond the local span of a CoinJoin mixing
-/// session — while keeping peak retention modest for mobile hosts.
-const MAX_RETAINED_COMMITTED_FILTERS: usize = 20_000;
-
-/// A deferred re-test of newly derived scripts against the already-committed
-/// filter range on disk. See [`FiltersManager::drain_committed_rescans`].
-///
-/// `ceiling` is the manager's `committed_height` captured at the moment the
-/// scripts were derived. Heights above the ceiling were still in active
-/// batches at derivation time and were tested against these scripts by the
-/// normal per-batch scan, so only the range at or below the ceiling needs
-/// re-opening.
-struct PendingCommittedRescan {
-    /// Highest committed height at the time these scripts were derived.
-    ceiling: u32,
-    /// Newly derived scriptPubKeys, attributed per owning wallet.
-    scripts: HashMap<WalletId, HashSet<ScriptBuf>>,
-}
 
 /// Filters manager for downloading and matching compact block filters.
 ///
@@ -112,25 +84,6 @@ pub struct FiltersManager<
     /// `BlockProcessed` and the per-wallet record of which wallets already
     /// have a given processed block applied.
     pub(super) tracker: BlockMatchTracker,
-    /// Newly derived scripts awaiting a re-test against the already-committed
-    /// filter range on disk (issue #846). Populated on every `BlockProcessed`
-    /// that carried gap-limit-derived scripts and drained to a fixpoint by
-    /// `drain_committed_rescans`. In-memory only; see the restart caveat in
-    /// that method's docs.
-    pending_committed_rescans: Vec<PendingCommittedRescan>,
-    /// Per-wallet scripts already tested against a committed range, so the same
-    /// script is never re-matched against committed filters more than once.
-    /// Bounded by the wallet's derived key count, not by block count. Correct
-    /// because a committed range is always scanned against every script that
-    /// existed when the range committed: a script only needs its one pass over
-    /// the range that was committed *before* it was derived.
-    committed_tested_scripts: HashMap<WalletId, HashSet<ScriptBuf>>,
-    /// Filters of committed batches, keyed by height, retained for the #846
-    /// committed-range re-test. Filters are moved here on commit rather than
-    /// dropped, so newly derived scripts can be tested against ranges the
-    /// wallet already advanced past. Capped at `MAX_RETAINED_COMMITTED_FILTERS`
-    /// (evicting the lowest heights) and cleared on full sync / rescan reset.
-    committed_filters: BTreeMap<u32, (BlockHash, BlockFilter)>,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -175,9 +128,6 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             active_batches: BTreeMap::new(),
             processing_height: 0,
             tracker: BlockMatchTracker::new(),
-            pending_committed_rescans: Vec::new(),
-            committed_tested_scripts: HashMap::new(),
-            committed_filters: BTreeMap::new(),
         }
     }
 
@@ -199,14 +149,6 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         self.tracker.clear();
         self.pending_batches.clear();
         self.filter_pipeline = FiltersPipeline::new();
-        // A rescan rolls `committed_height` back, so the committed-range
-        // re-test bookkeeping no longer applies: forget which scripts were
-        // tested against the (now un-committed) range, the retained committed
-        // filters, and any queued re-tests, so the fresh scan re-establishes
-        // coverage from scratch.
-        self.pending_committed_rescans.clear();
-        self.committed_tested_scripts.clear();
-        self.committed_filters.clear();
     }
 
     async fn load_filters(
@@ -510,23 +452,10 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         // Phase 4: Create lookahead batches up to MAX_LOOKAHEAD_BATCHES
         events.extend(self.try_create_lookahead_batches().await?);
 
-        // Phase 5: Re-open already-committed ranges for scripts derived after
-        // those ranges committed (issue #846). Runs only when a prior
-        // `BlockProcessed` queued gap-limit-derived scripts; the common
-        // no-new-scripts path leaves the queue empty and skips this entirely.
-        events.extend(self.drain_committed_rescans().await?);
-
         // If no active batches and all filters downloaded, emit FiltersSyncComplete.
         // This handles both initial sync (Syncing → Synced transition) and incremental
         // updates (already Synced, signal BlocksManager that no more blocks are coming).
-        //
-        // A committed-range re-open (Phase 5) can leave a below-frontier block
-        // in flight with no owning active batch, or leave scripts still queued;
-        // hold off on "complete" until both drain so the re-opened block's
-        // outputs are applied before the manager reports done.
         if self.active_batches.is_empty()
-            && self.pending_committed_rescans.is_empty()
-            && !self.tracker.has_in_flight()
             && matches!(self.state(), SyncState::Syncing | SyncState::Synced)
             && self.progress.committed_height() >= self.progress.filter_header_tip_height()
             && self.progress.committed_height() >= self.progress.target_height()
@@ -534,13 +463,6 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             if self.state() == SyncState::Syncing {
                 self.set_state(SyncState::Synced);
             }
-            // Fully synced with no committed-range re-open outstanding: release
-            // the retained committed filters. Their sole purpose is recovering
-            // index↔height inversions within a sync pass, which is now done; a
-            // later incremental block repopulates the retained set from its own
-            // commit before deriving against it.
-            self.committed_filters.clear();
-            self.committed_tested_scripts.clear();
             tracing::info!("Filter sync complete at height {}", self.progress.committed_height());
             events.push(SyncEvent::FiltersSyncComplete {
                 tip_height: self.progress.committed_height(),
@@ -590,7 +512,40 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                         events.extend(self.rescan_batch(later_start, &scripts_by_wallet).await?);
                     }
 
-                    // Check if rescan found more blocks
+                    // Newly derived scripts also have to reach ranges that
+                    // already committed: those blocks were matched against a
+                    // watch set that predates these scripts, and nothing else
+                    // ever looks below `committed_height` again (#846). That
+                    // backward sweep walks stored history — the expensive
+                    // direction — so defer it: accumulate the scripts here
+                    // and sweep once when the forward fixpoint is quiescent,
+                    // instead of re-walking the committed range on every
+                    // derivation round.
+                    if let Some(batch) = self.active_batches.get_mut(&batch_start) {
+                        batch.accumulate_backward_scripts(scripts_by_wallet);
+                        if batch.pending_blocks() > 0 {
+                            // Forward rescan found blocks; converge the
+                            // forward direction first.
+                            break;
+                        }
+                    }
+                }
+
+                // Forward direction quiescent: one combined backward sweep
+                // over the committed range with everything accumulated. Hits
+                // attribute to this batch, so scripts their processing
+                // derives re-enter through `collected_scripts` above and
+                // only genuinely new scripts get a follow-up sweep.
+                let backward_scripts = self
+                    .active_batches
+                    .get_mut(&batch_start)
+                    .map(|b| b.take_backward_scripts())
+                    .unwrap_or_default();
+                if !backward_scripts.is_empty() {
+                    events
+                        .extend(self.rescan_committed_range(batch_start, &backward_scripts).await?);
+
+                    // Check if the backward sweep found more blocks
                     if let Some(batch) = self.active_batches.get(&batch_start) {
                         if batch.pending_blocks() > 0 {
                             // Found more blocks, can't commit yet
@@ -607,7 +562,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             // Commit this batch. Advance per-wallet `synced_height` only for
             // wallets that were behind for this batch at scan time. Already-synced
             // wallets are never touched.
-            let mut batch = self.active_batches.remove(&batch_start).unwrap();
+            let batch = self.active_batches.remove(&batch_start).unwrap();
             let end = batch.end_height();
             if end > self.progress.committed_height() {
                 self.progress.update_committed_height(end);
@@ -615,22 +570,17 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 if !scanned_wallets.is_empty() {
                     let mut wallet = self.wallet.write().await;
                     for wallet_id in &scanned_wallets {
-                        wallet.update_wallet_synced_height(wallet_id, end);
+                        // Contiguity guard: a batch extends a wallet's certified
+                        // coverage only if the wallet was already certified up to
+                        // the batch's start. A checkpoint rewound after this batch
+                        // was scanned (an account added mid-flight) stays behind
+                        // and is picked up by the tick rescan instead of being
+                        // silently clobbered forward (dashpay/rust-dashcore#649).
+                        if wallet.wallet_synced_height(wallet_id).saturating_add(1) >= batch_start {
+                            wallet.update_wallet_synced_height(wallet_id, end);
+                        }
                     }
                 }
-            }
-            // Retain this committed batch's filters (moved, not cloned) so
-            // scripts derived after this point can still be tested against the
-            // range the wallet has now advanced past (issue #846). Bounded by
-            // `MAX_RETAINED_COMMITTED_FILTERS`, evicting the lowest heights.
-            for (key, filter) in batch.take_filters() {
-                self.committed_filters.insert(key.height(), (*key.hash(), filter));
-            }
-            while self.committed_filters.len() > MAX_RETAINED_COMMITTED_FILTERS {
-                let Some((&lowest, _)) = self.committed_filters.iter().next() else {
-                    break;
-                };
-                self.committed_filters.remove(&lowest);
             }
             // Drop processed-wallet records for the committed range. Below the
             // new committed_height a new wallet can only get here via the
@@ -782,6 +732,26 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             }
         }
 
+        Ok(self.queue_new_script_matches(batch_start, block_to_wallets, "Rescan"))
+    }
+
+    /// Queue filter matches driven by newly derived scripts for
+    /// (re-)download — the shared tail of `rescan_batch` and
+    /// `rescan_committed_range`.
+    ///
+    /// These matches come from scripts that did not exist when their block
+    /// was first processed, so a processed record must not suppress the
+    /// re-download: the block has to be re-applied against the extended
+    /// pools (`track_for_new_scripts`). Genuinely new blocks are charged to
+    /// `batch_start`'s `pending_blocks` accounting so its commit waits for
+    /// them; blocks already on their way still get a fresh `BlocksNeeded`
+    /// so the pipeline merges late wallet ids into its pending wallet set.
+    fn queue_new_script_matches(
+        &mut self,
+        batch_start: u32,
+        block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>>,
+        context: &str,
+    ) -> Vec<SyncEvent> {
         let mut events = Vec::new();
         let mut blocks_needed: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
         let mut new_blocks_count = 0;
@@ -790,10 +760,6 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             self.progress.add_matched(block_to_wallets.len() as u32);
         }
         for (key, wallets) in block_to_wallets {
-            // Matches here are driven by scripts that did not exist when the
-            // block was first processed, so a processed record must not
-            // suppress the re-download: the block has to be re-applied
-            // against the extended pools.
             match self.tracker.track_for_new_scripts(&key, batch_start, wallets) {
                 BlockTrackResult::NewlyTracked {
                     wallets,
@@ -804,8 +770,6 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 BlockTrackResult::InFlight {
                     wallets,
                 } => {
-                    // Block already on its way; merge late wallet ids into the
-                    // pipeline's pending wallet set via a fresh BlocksNeeded.
                     blocks_needed.insert(key, wallets);
                 }
                 // Never returned by track_for_new_scripts.
@@ -818,7 +782,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             if let Some(batch) = self.active_batches.get_mut(&batch_start) {
                 batch.set_pending_blocks(batch.pending_blocks() + new_blocks_count);
             }
-            tracing::info!("Rescan found {} additional blocks", new_blocks_count);
+            tracing::info!("{} found {} additional blocks", context, new_blocks_count);
         }
         if !blocks_needed.is_empty() {
             events.push(SyncEvent::BlocksNeeded {
@@ -826,178 +790,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             });
         }
 
-        Ok(events)
-    }
-
-    /// Queue newly derived scripts for a re-test against the already-committed
-    /// filter range. Called from the `BlockProcessed` handler for every block
-    /// that produced gap-limit-derived scripts, whether it belongs to a live
-    /// batch or was itself re-opened from below the committed frontier.
-    ///
-    /// The `ceiling` is the current `committed_height`: heights above it are
-    /// still in flight in active batches and see these scripts via the normal
-    /// per-batch scan, so only the committed range needs the deferred re-test.
-    pub(super) fn enqueue_committed_rescan(
-        &mut self,
-        new_scripts: &BTreeMap<WalletId, Vec<ScriptBuf>>,
-    ) {
-        let scripts: HashMap<WalletId, HashSet<ScriptBuf>> = new_scripts
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(id, s)| (*id, s.iter().cloned().collect()))
-            .collect();
-        if scripts.is_empty() {
-            return;
-        }
-        self.pending_committed_rescans.push(PendingCommittedRescan {
-            ceiling: self.progress.committed_height(),
-            scripts,
-        });
-    }
-
-    /// Re-test queued newly derived scripts against the retained committed
-    /// filter range, re-opening any committed block whose outputs pay a script
-    /// that did not exist when that block was first scanned (issue #846).
-    ///
-    /// Root cause this closes: discovery suppression was keyed by scan progress
-    /// (which heights a wallet already committed), not by which scripts a block
-    /// was tested against. A forward index↔height inversion — a low external
-    /// index funded in a later block, whose gap-limit window extension covers a
-    /// higher index paid in an earlier, already-committed block — left the
-    /// earlier block's outputs permanently invisible: `rescan_batch` only
-    /// reaches `active_batches`, and commit removed the batch and pruned the
-    /// tracker at or below the committed height. Committed filters are now
-    /// retained (`committed_filters`) so this re-test has something to match.
-    ///
-    /// Cost model: zero work in the common case (queue empty). When scripts are
-    /// queued, each is matched against the retained committed range at most once
-    /// (`committed_tested_scripts` dedup); a range that commits later is already
-    /// scanned against these scripts by `scan_batch`, so no re-test is owed for
-    /// it. Matching walks in-memory retained filters (bounded by
-    /// `MAX_RETAINED_COMMITTED_FILTERS`), no disk I/O.
-    ///
-    /// Restart caveat: the queue, `committed_tested_scripts`, and the retained
-    /// `committed_filters` are all in-memory only. The re-open is driven by a
-    /// `BlockProcessed` deriving new scripts, which happens whenever a funding
-    /// block is (re)processed during a sync pass — so a wallet that syncs (or
-    /// re-syncs) with this code present self-heals within that pass. A wallet
-    /// that had already completed its sync and persisted the stall *before* this
-    /// fix does not re-derive scripts on restart (nothing below its persisted
-    /// `synced_height` is reprocessed) and is not retroactively healed; such a
-    /// wallet still needs a rescan from its birth height. New syncs never enter
-    /// the stalled state.
-    async fn drain_committed_rescans(&mut self) -> SyncResult<Vec<SyncEvent>> {
-        if self.pending_committed_rescans.is_empty() || self.committed_filters.is_empty() {
-            // Nothing queued, or nothing committed yet to re-test against. Drop
-            // the queue either way: with no committed range there is no owed
-            // re-test (every height was still active when these scripts were
-            // derived and saw them via the normal per-batch scan).
-            self.pending_committed_rescans.clear();
-            return Ok(vec![]);
-        }
-        let pending = std::mem::take(&mut self.pending_committed_rescans);
-
-        let mut events = Vec::new();
-        for rescan in pending {
-            let ceiling = rescan.ceiling;
-
-            // Drop scripts already tested against a committed range; keep only
-            // the fresh ones and mark them tested.
-            let mut fresh_queries: Vec<(WalletId, FilterQuery)> = Vec::new();
-            for (wallet_id, scripts) in rescan.scripts {
-                let tested = self.committed_tested_scripts.entry(wallet_id).or_default();
-                let fresh: Vec<ScriptBuf> =
-                    scripts.into_iter().filter(|s| tested.insert(s.clone())).collect();
-                if fresh.is_empty() {
-                    continue;
-                }
-                // Include the wallet's bare owner/voting filter elements too,
-                // exactly as `scan_batch` builds its per-wallet query.
-                let elements = self.wallet.read().await.monitored_filter_elements_for(&wallet_id);
-                let mut query: FilterQuery = fresh.iter().map(|s| s.as_bytes()).collect();
-                for element in &elements {
-                    query.push(element);
-                }
-                fresh_queries.push((wallet_id, query));
-            }
-            if fresh_queries.is_empty() {
-                continue;
-            }
-
-            // Match the fresh queries against every retained committed filter at
-            // or below the derivation-time ceiling. Collect first, then touch
-            // the tracker, so the immutable borrow of `committed_filters` ends
-            // before the mutable tracker calls.
-            let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> =
-                BTreeMap::new();
-            for (&height, (hash, filter)) in self.committed_filters.range(..=ceiling) {
-                let key = FilterMatchKey::new(height, *hash);
-                for (wallet_id, query) in &fresh_queries {
-                    match filter.match_any(key.hash(), query) {
-                        Ok(true) => {
-                            block_to_wallets.entry(key.clone()).or_default().insert(*wallet_id);
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                "committed-range rescan match_any error at height {}: {}; treating as non-match",
-                                height,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-
-            if block_to_wallets.is_empty() {
-                continue;
-            }
-
-            let mut blocks_needed: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
-            let mut matched_count = 0u32;
-            for (key, wallets) in block_to_wallets {
-                // Below the committed frontier there is no owning active batch,
-                // so no `pending_blocks` counter to touch. Attribution uses the
-                // block's own height, which is <= committed_height < every active
-                // batch start, so a later `BlockProcessed` for the re-opened
-                // block cannot decrement a live batch. Matches are driven by
-                // scripts absent when the block was first processed, so
-                // `track_for_new_scripts` always re-queues past the
-                // processed-record gate.
-                let attributed_start = key.height();
-                match self.tracker.track_for_new_scripts(&key, attributed_start, wallets) {
-                    BlockTrackResult::NewlyTracked {
-                        wallets,
-                    } => {
-                        blocks_needed.insert(key, wallets);
-                        matched_count += 1;
-                    }
-                    BlockTrackResult::InFlight {
-                        wallets,
-                    } => {
-                        blocks_needed.insert(key, wallets);
-                    }
-                    // Never returned by track_for_new_scripts.
-                    BlockTrackResult::AlreadyProcessed => {}
-                }
-            }
-
-            if matched_count > 0 {
-                self.progress.add_matched(matched_count);
-                tracing::info!(
-                    "Committed-range rescan re-opened {} block(s) at/below height {} for newly derived scripts (#846)",
-                    matched_count,
-                    ceiling,
-                );
-            }
-            if !blocks_needed.is_empty() {
-                events.push(SyncEvent::BlocksNeeded {
-                    blocks: blocks_needed,
-                });
-            }
-        }
-
-        Ok(events)
+        events
     }
 
     /// Scan a specific batch, matching its filters against each behind-wallet's
@@ -1190,6 +983,97 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         }
 
         Ok(events)
+    }
+
+    /// Re-test newly derived scriptPubKeys against the already-committed
+    /// filter range below `batch_start` (#846).
+    ///
+    /// A committed batch is gone from `active_batches` and every wallet's
+    /// `synced_height` has advanced past it, so `rescan_batch` can never
+    /// reach it again — but a script derived later by gap-limit maintenance
+    /// (CoinJoin index↔height inversions being the concrete case) may pay
+    /// out inside that range. The filters themselves are address-independent
+    /// BIP-158 commitments and are all persisted, so the committed range is
+    /// re-tested from storage — no network traffic — and only genuinely
+    /// matching blocks are re-downloaded, via the same
+    /// `track_for_new_scripts` path `rescan_batch` uses.
+    ///
+    /// Matched blocks attribute to the committing batch at `batch_start`:
+    /// its `pending_blocks` accounting defers the commit, and scripts their
+    /// processing derives collect into that batch, so the existing
+    /// commit-time fixpoint loop covers the backward direction too.
+    ///
+    /// Deliberately matches only `new_scripts` — not the wallets' bare
+    /// filter elements — since those were already watched when the range
+    /// was originally scanned; including them would re-download previously
+    /// processed blocks across the whole history.
+    pub(super) async fn rescan_committed_range(
+        &mut self,
+        batch_start: u32,
+        new_scripts: &HashMap<WalletId, HashSet<ScriptBuf>>,
+    ) -> SyncResult<Vec<SyncEvent>> {
+        let Some(range_end) = batch_start.checked_sub(1) else {
+            return Ok(vec![]);
+        };
+
+        let wallet_queries: Vec<(WalletId, Vec<ScriptBuf>)> = new_scripts
+            .iter()
+            .filter(|(_, scripts)| !scripts.is_empty())
+            .map(|(id, scripts)| (*id, scripts.iter().cloned().collect()))
+            .collect();
+        if wallet_queries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Nothing relevant can precede the earliest wallet birth height, and
+        // nothing is loadable below the first stored filter.
+        let wallet_base = self.wallet.read().await.earliest_required_height().await;
+        let Some(filter_base) = self.filter_storage.read().await.filter_start_height().await else {
+            return Ok(vec![]);
+        };
+        let range_start = wallet_base.max(filter_base);
+        if range_start > range_end {
+            return Ok(vec![]);
+        }
+
+        tracing::info!(
+            "Rescan committed filters ({}-{}) for new scripts across {} wallets",
+            range_start,
+            range_end,
+            wallet_queries.len()
+        );
+
+        let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
+        let mut chunk_start = range_start;
+        while chunk_start <= range_end {
+            let chunk_end = (chunk_start + BATCH_PROCESSING_SIZE - 1).min(range_end);
+            // A chunk the storage cannot serve (e.g. filters pruned or never
+            // stored for a sub-range) is skipped rather than failing the
+            // commit: the sweep is best-effort recovery over whatever
+            // history is locally available.
+            let filters = match self.load_filters(chunk_start, chunk_end).await {
+                Ok(filters) => filters,
+                Err(e) => {
+                    tracing::warn!(
+                        "Committed-range rescan skipping {}-{}: {}",
+                        chunk_start,
+                        chunk_end,
+                        e
+                    );
+                    chunk_start = chunk_end + 1;
+                    continue;
+                }
+            };
+            for (wallet_id, scripts) in &wallet_queries {
+                let matches = check_compact_filters_for_elements(&filters, scripts, &[], 0);
+                for key in matches {
+                    block_to_wallets.entry(key).or_default().insert(*wallet_id);
+                }
+            }
+            chunk_start = chunk_end + 1;
+        }
+
+        Ok(self.queue_new_script_matches(batch_start, block_to_wallets, "Committed-range rescan"))
     }
 
     /// Handle notification that new filter headers are available.
@@ -1599,6 +1483,154 @@ mod tests {
         assert_eq!(manager.progress.committed_height(), 4999);
         assert_eq!(multi.read().await.wallet_synced_height(&wallet_a), 4999);
         assert_eq!(multi.read().await.wallet_synced_height(&wallet_b), 0);
+    }
+
+    /// Contiguity guard (dashpay/rust-dashcore#649): a batch scanned before an
+    /// account-add rewinds the wallet's checkpoint must NOT clobber the rewound
+    /// value forward at commit time — otherwise the account-addition rescan is
+    /// silently cancelled. The wallet stays behind and the tick picks it up.
+    #[tokio::test]
+    async fn mid_flight_account_add_does_not_clobber_rescan_floor() {
+        let wallet_a: WalletId = [0xAA; 32];
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        {
+            let mut w = multi.write().await;
+            // Already synced up to 4999, so the next batch legitimately starts at 5000.
+            w.insert_wallet(
+                wallet_a,
+                MockWalletState {
+                    synced_height: 4999,
+                    ..MockWalletState::default()
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi.clone()).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Batch [5000..9999] scanned with wallet_a recorded, ready to commit.
+        let mut batch = FiltersBatch::new(5000, 9999, HashMap::new());
+        batch.set_pending_blocks(0);
+        batch.mark_scanned();
+        batch.mark_rescan_complete();
+        batch.set_scanned_wallets(BTreeSet::from([wallet_a]));
+        manager.active_batches.insert(5000, batch);
+
+        // Simulate an account being added mid-flight: the wallet's checkpoint is
+        // rewound to just below birth, far below this batch's start.
+        multi.write().await.wallet_mut(&wallet_a).synced_height = 49;
+
+        manager.try_commit_batches().await.unwrap();
+
+        // committed_height still advances (chain progress), but the wallet's
+        // checkpoint is NOT dragged forward over the gap it must rescan.
+        assert_eq!(manager.progress.committed_height(), 9999);
+        assert_eq!(
+            multi.read().await.wallet_synced_height(&wallet_a),
+            49,
+            "the rewound checkpoint must survive commit — the batch is non-contiguous with it"
+        );
+        // The wallet is still behind, so the next tick rescans it.
+        assert!(
+            multi.read().await.wallets_behind(9999).contains(&wallet_a),
+            "the wallet remains behind and is picked up by the tick rescan"
+        );
+    }
+
+    /// The contiguity guard is transparent in normal operation: contiguous
+    /// ascending batches advance each wallet's checkpoint exactly as before.
+    #[tokio::test]
+    async fn contiguity_guard_permits_normal_advance() {
+        let wallet_a: WalletId = [0xCC; 32];
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        multi.write().await.insert_wallet(wallet_a, MockWalletState::default());
+        let mut manager = create_multi_test_manager(multi.clone()).await;
+        manager.set_state(SyncState::Syncing);
+
+        // First batch starts at 0 = synced_height (0) + ... the wallet is fresh,
+        // so this batch is contiguous and advances the checkpoint.
+        let mut batch1 = FiltersBatch::new(0, 4999, HashMap::new());
+        batch1.set_pending_blocks(0);
+        batch1.mark_scanned();
+        batch1.mark_rescan_complete();
+        batch1.set_scanned_wallets(BTreeSet::from([wallet_a]));
+        manager.active_batches.insert(0, batch1);
+
+        manager.try_commit_batches().await.unwrap();
+        assert_eq!(multi.read().await.wallet_synced_height(&wallet_a), 4999);
+
+        // Second batch starts exactly at synced_height + 1 = 5000: still
+        // contiguous, so it advances too.
+        let mut batch2 = FiltersBatch::new(5000, 9999, HashMap::new());
+        batch2.set_pending_blocks(0);
+        batch2.mark_scanned();
+        batch2.mark_rescan_complete();
+        batch2.set_scanned_wallets(BTreeSet::from([wallet_a]));
+        manager.active_batches.insert(5000, batch2);
+
+        manager.try_commit_batches().await.unwrap();
+        assert_eq!(
+            multi.read().await.wallet_synced_height(&wallet_a),
+            9999,
+            "contiguous ascending batches advance the checkpoint unchanged by the guard"
+        );
+    }
+
+    /// Marvin QA-001 round 2: two wallets in the SAME batch, only one of them
+    /// rewound mid-flight (simulating an account add on wallet_a only). The
+    /// contiguity guard must block wallet_a's advance while still advancing
+    /// wallet_b normally — a per-wallet leak here would either strand a
+    /// healthy wallet or silently clobber the rewound one.
+    #[tokio::test]
+    async fn contiguity_guard_is_per_wallet_not_batch_wide() {
+        let wallet_a: WalletId = [0xAA; 32];
+        let wallet_b: WalletId = [0xBB; 32];
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_a,
+                MockWalletState {
+                    synced_height: 4999,
+                    ..MockWalletState::default()
+                },
+            );
+            w.insert_wallet(
+                wallet_b,
+                MockWalletState {
+                    synced_height: 4999,
+                    ..MockWalletState::default()
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi.clone()).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Batch [5000..9999] scanned with BOTH wallets recorded.
+        let mut batch = FiltersBatch::new(5000, 9999, HashMap::new());
+        batch.set_pending_blocks(0);
+        batch.mark_scanned();
+        batch.mark_rescan_complete();
+        batch.set_scanned_wallets(BTreeSet::from([wallet_a, wallet_b]));
+        manager.active_batches.insert(5000, batch);
+
+        // Only wallet_a gets an account added mid-flight (rewound). wallet_b
+        // is untouched and remains legitimately contiguous with this batch.
+        multi.write().await.wallet_mut(&wallet_a).synced_height = 49;
+
+        manager.try_commit_batches().await.unwrap();
+
+        assert_eq!(manager.progress.committed_height(), 9999);
+        assert_eq!(
+            multi.read().await.wallet_synced_height(&wallet_a),
+            49,
+            "wallet_a's rewound checkpoint must survive commit"
+        );
+        assert_eq!(
+            multi.read().await.wallet_synced_height(&wallet_b),
+            9999,
+            "wallet_b was legitimately contiguous and must still advance despite \
+             sharing a batch with a rewound wallet"
+        );
     }
 
     /// `scan_batch` with two wallets at different `synced_height` values:
