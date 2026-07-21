@@ -400,6 +400,17 @@ class PlatformWalletManager(
     private val identityKeyDeriver get() = coreChildren.identityKeyDeriver
     private val persistenceHandler get() = coreChildren.persistenceHandler
 
+    /**
+     * Identity keys whose private half could not be derived/stored during
+     * persistence (keyed by public-key hex) — the queryable "keys pending"
+     * state of dashpay/platform#4053. Such keys were persisted watch-only
+     * and cannot sign; repair via [repairIdentityKey]. Empty in the healthy
+     * case.
+     */
+    val pendingIdentityKeys:
+        kotlinx.coroutines.flow.StateFlow<Map<String, PlatformWalletPersistenceHandler.PendingIdentityKey>>
+        get() = persistenceHandler.pendingIdentityKeys
+
     /** `MnemonicResolverHandle` for FFI calls that derive from a stored mnemonic. */
     val mnemonicResolverHandle: Long get() = mnemonicResolver.nativeHandle
 
@@ -419,6 +430,12 @@ class PlatformWalletManager(
      * "one allowed exception"); Kotlin only encrypts the returned scalar.
      * Returns the recorded storage identifier (e.g. `privkey.<pubkeyHex>`),
      * or throws on a derivation / storage failure.
+     *
+     * On success the key is dropped from [pendingIdentityKeys] via the
+     * persistence handler: the repair stores the private key directly through
+     * the deriver, bypassing `onPersistIdentityKeyUpsert` (the only persist
+     * path that clears pending), so it must clear the entry itself or the
+     * repaired key would keep showing as pending.
      */
     suspend fun repairIdentityKey(
         walletId: ByteArray,
@@ -434,12 +451,16 @@ class PlatformWalletManager(
         // skips the actual re-derive when the stored scalar is already
         // decryptable — exactly the case a health-sheet repair is invoked
         // for (an undecryptable legacy blob) is NOT skipped.
-        identityKeyDeriver.deriveAndStore(
+        val storageIdentifier = identityKeyDeriver.deriveAndStore(
             walletId = walletId,
             publicKeyData = publicKeyData,
             identityIndex = identityIndex,
             keyIndex = keyIndex,
         )?.identifier
+        if (storageIdentifier != null) {
+            persistenceHandler.markIdentityKeyRepaired(publicKeyData.toHex())
+        }
+        storageIdentifier
     }
 
     /**
@@ -1637,7 +1658,8 @@ class PlatformWalletManager(
      * its next tick; a stopped loop observes it on next start. Equal/forward
      * heights are harmless no-ops for scan purposes. If the process dies
      * before the loop consumes and persists progress, the user must reissue
-     * the request. Unknown wallets surface as typed [DashSdkError.NotFound].
+     * the request. Unknown wallets surface as typed
+     * [DashSdkError.PlatformWallet.NotFound] (native code 98).
      */
     suspend fun rescanSpvFilters(walletId: ByteArray, fromHeight: Int) =
         withContext(Dispatchers.IO) {

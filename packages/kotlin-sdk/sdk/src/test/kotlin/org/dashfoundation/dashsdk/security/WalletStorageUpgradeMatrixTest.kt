@@ -1,0 +1,449 @@
+package org.dashfoundation.dashsdk.security
+
+import android.security.keystore.UserNotAuthenticatedException
+import androidx.test.core.app.ApplicationProvider
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import javax.crypto.BadPaddingException
+
+/**
+ * Full upgrade-matrix coverage for [WalletStorage]'s identity-key recovery
+ * (dashpay/platform#4060). Exercises every stored-blob shape an upgraded
+ * install can hold — legacy AES-GCM, pre-alias-split RSA under
+ * [KeystoreManager.KEYS_ALIAS], and current policy-alias RSA — plus the
+ * stranded and auth-propagation cases.
+ *
+ * The real AndroidKeyStore crypto cannot run on the JVM (no Robolectric
+ * provider — see [KeySecurityPolicyTest]), so a [FakeKeystoreManager]
+ * substitutes deterministic in-memory "crypto" through the `open` seams on
+ * [KeystoreManager]. It models the load-bearing invariants the production code
+ * relies on: an empty-IV blob only decrypts under the alias that produced it,
+ * [KeystoreManager.KEYS_ALIAS] holds at most one former key (AES XOR RSA), and
+ * a public-key encrypt provisions the policy alias. This pins the ROUTING and
+ * migration behavior; the concrete keystore crypto is out of unit-test reach by
+ * construction.
+ */
+@RunWith(RobolectricTestRunner::class)
+class WalletStorageUpgradeMatrixTest {
+
+    private val pub = "02aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+    private val secret = ByteArray(32) { (it + 1).toByte() }
+
+    private lateinit var fake: FakeKeystoreManager
+    private lateinit var storage: WalletStorage
+
+    @Before
+    fun setUp() = runBlocking {
+        fake = FakeKeystoreManager()
+        storage = WalletStorage(ApplicationProvider.getApplicationContext(), fake)
+        // Isolate from any state a prior test left in the shared DataStore file.
+        storage.deleteAll()
+    }
+
+    // ── Blob-shape / routing matrix ──────────────────────────────────────
+
+    /** New-alias (current-scheme) blob: decrypts under the policy alias, no migration. */
+    @Test
+    fun currentPolicyAliasBlobDecryptsDirectly() = runBlocking {
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        storage.storePrivateKey(pub, secret)
+
+        assertTrue(storage.isPrivateKeyDecryptable(pub))
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+        // No fallback path was taken.
+        assertEquals(0, fake.legacyRsaFallbackCalls)
+    }
+
+    /** Legacy AES-GCM blob: recovered via the retained AES key and migrated forward. */
+    @Test
+    fun legacyAesBlobIsRecoveredAndMigrated() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.AES
+        fake.scheme = FakeKeystoreManager.Scheme.LEGACY_AES
+        storage.storePrivateKey(pub, secret) // writes a non-empty-IV AES blob
+
+        // Health check sees the retained AES key.
+        assertTrue(storage.isPrivateKeyDecryptable(pub))
+
+        // Migration re-encrypts under the current alias.
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+
+        // The stored blob is now a current-alias blob: a second read no longer
+        // touches the legacy AES path.
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.NONE
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+    }
+
+    /** Legacy AES key already deleted by an older build → stranded, reported undecryptable. */
+    @Test
+    fun legacyAesBlobWithDeletedKeyIsStranded() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.AES
+        fake.scheme = FakeKeystoreManager.Scheme.LEGACY_AES
+        storage.storePrivateKey(pub, secret)
+
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.NONE // key gone
+        assertFalse(storage.isPrivateKeyDecryptable(pub))
+        // decryptLegacyKeysBlob returns null → retrieve yields null, not a wrong value.
+        assertNull(storage.retrievePrivateKey(pub))
+    }
+
+    /**
+     * Pre-alias-split RSA blob under KEYS_ALIAS with an empty policy alias:
+     * the upgrade fast path recovers it with the former RSA key and migrates.
+     */
+    @Test
+    fun formerRsaBlobEmptyPolicyTakesFastPathAndMigrates() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA
+        fake.scheme = FakeKeystoreManager.Scheme.FORMER_RSA
+        storage.storePrivateKey(pub, secret) // former-RSA blob; policy alias not provisioned
+
+        assertTrue(storage.isPrivateKeyDecryptable(pub)) // recoverable via former RSA key
+
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT // migration writes a policy blob
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+        assertTrue(fake.legacyRsaFallbackCalls > 0)
+
+        // Migrated: the next read decrypts straight under the (now provisioned)
+        // policy alias without another former-RSA fallback.
+        val before = fake.legacyRsaFallbackCalls
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+        assertEquals(0, fake.legacyRsaFallbackCalls - before)
+    }
+
+    /**
+     * Mixed window: the policy alias already holds a key (so the fast path is
+     * skipped) while a former-RSA blob lingers. The policy decrypt fails with a
+     * wrong-key crypto error and the code falls back to the former RSA key.
+     */
+    @Test
+    fun formerRsaBlobProvisionedPolicyTakesCatchFallback() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA
+        fake.scheme = FakeKeystoreManager.Scheme.FORMER_RSA
+        storage.storePrivateKey(pub, secret)
+
+        // Simulate a sibling key already provisioned at the policy alias.
+        fake.policyKeyProvisioned = true
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+        assertTrue(fake.legacyRsaFallbackCalls > 0) // reached the catch-branch fallback
+    }
+
+    /**
+     * Former-RSA blob whose KEYS_ALIAS key is gone → stranded. No present key can
+     * open it, so recovery yields null (a re-derive signal, like the legacy-AES
+     * stranded path) rather than a bogus plaintext — and, critically, rather than
+     * an uncaught crypto exception into KeystoreSigner (dashpay/platform#4060).
+     */
+    @Test
+    fun formerRsaBlobWithDeletedKeyIsStranded() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA
+        fake.scheme = FakeKeystoreManager.Scheme.FORMER_RSA
+        storage.storePrivateKey(pub, secret)
+
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.NONE // former RSA key gone
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        assertFalse(storage.isPrivateKeyDecryptable(pub))
+        // Unrecoverable → null (not a wrong value, not a thrown BadPaddingException).
+        assertNull(storage.retrievePrivateKey(pub))
+    }
+
+    /**
+     * Regression (dashpay/platform#4060): a blob written under a *sibling* policy
+     * alias (e.g. a KEYS_ALIAS_AUTH_GATED blob read after an AUTH_GATED→DEVICE_BOUND
+     * switch) while an UNRELATED former RSA key still lingers at KEYS_ALIAS. The
+     * policy alias is unprovisioned, so the upgrade fast path is entered on former-
+     * RSA-key *presence* alone — but that key did not write this blob, so
+     * decryptLegacyRsaKeysBlob raises BadPaddingException. That wrong-key failure
+     * must be absorbed ("not this key") and reported as unrecoverable (null) so the
+     * host can re-derive, NOT escape uncaught into KeystoreSigner (which only
+     * catches UserNotAuthenticatedException). Before the fix this threw a raw
+     * BadPaddingException out of retrievePrivateKey.
+     */
+    @Test
+    fun siblingAliasBlobUnderUnprovisionedPolicyDoesNotThrow() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA // unrelated former RSA key present
+        fake.scheme = FakeKeystoreManager.Scheme.SIBLING_POLICY
+        storage.storePrivateKey(pub, secret) // sibling-alias blob; policy alias NOT provisioned
+
+        // The former-RSA fast path is attempted (presence-based) but cannot open
+        // the blob; the wrong-key failure is absorbed and surfaces as null.
+        assertNull(storage.retrievePrivateKey(pub))
+        assertTrue(fake.legacyRsaFallbackCalls > 0) // recovery was tried, not skipped
+
+        // And key-health must NOT report the stranded blob decryptable
+        // (finding e17e265dc680): the former RSA key is present but does not open
+        // this sibling-alias blob, so probing it yields BadPadding -> false, which
+        // lets WalletKeyHealthSheet offer the re-derive/repair path. Before the
+        // fix this returned true on bare key presence.
+        assertFalse(storage.isPrivateKeyDecryptable(pub))
+    }
+
+    /**
+     * Key-health probes actual decryptability, not presence — but an auth-gated
+     * key with a closed window is DECRYPTABLE, not stranded (finding e17e265dc680).
+     * A provisioned policy-alias blob whose decrypt throws
+     * UserNotAuthenticatedException (window closed) must report decryptable: the
+     * key is present and the value recovers once the user authenticates, and the
+     * probe must not prompt. (Contrast siblingAlias above, where the key is present
+     * but genuinely wrong -> BadPadding -> not decryptable.)
+     */
+    @Test
+    fun authGatedPolicyKeyReportsDecryptableWithoutPrompting() = runBlocking {
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        storage.storePrivateKey(pub, secret) // provisions the policy alias, TAG_POLICY blob
+
+        fake.throwAuthOnPolicyDecrypt = true // closed auth window: decrypt throws UserNotAuth
+        assertTrue(storage.isPrivateKeyDecryptable(pub))
+    }
+
+    /**
+     * The same auth-gated semantics on the former-RSA recovery path: a present but
+     * auth-gated KEYS_ALIAS RSA key that would open the blob after auth reports
+     * decryptable when the window is closed (UserNotAuth), rather than stranded.
+     */
+    @Test
+    fun authGatedFormerRsaKeyReportsDecryptable() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA
+        fake.scheme = FakeKeystoreManager.Scheme.FORMER_RSA
+        storage.storePrivateKey(pub, secret) // former-RSA blob; policy alias unprovisioned
+
+        fake.throwAuthOnLegacyRsaDecrypt = true // closed window on the former RSA key
+        assertTrue(storage.isPrivateKeyDecryptable(pub))
+    }
+
+    /**
+     * Regression (dashpay/platform#4060, finding b80a15c93339): the
+     * "provisioned + locked + WRONG alias" case. The current AUTH_GATED policy
+     * alias is provisioned from an earlier period and its auth window is closed,
+     * but the blob was actually written by the DEVICE_BOUND sibling. The locked
+     * policy alias throws UserNotAuthenticatedException at cipher.init — before
+     * the ciphertext is examined — so a bare catch would mis-report it
+     * "decryptable". The prompt-free DEVICE_BOUND sibling opens the blob, proving
+     * the policy alias does not own it; since retrievePrivateKey under this policy
+     * never falls back to the sibling, the blob is genuinely strandable and
+     * key-health must report it undecryptable so the repair path fires.
+     */
+    @Test
+    fun provisionedLockedWrongAliasBlobDisprovedByPromptFreeSibling() = runBlocking {
+        fake.scheme = FakeKeystoreManager.Scheme.SIBLING_POLICY
+        storage.storePrivateKey(pub, secret) // sibling-written blob (TAG_SIBLING)
+
+        fake.policyKeyProvisioned = true // AUTH_GATED alias provisioned earlier...
+        fake.throwAuthOnPolicyDecrypt = true // ...and its auth window is closed
+        fake.deviceBoundSiblingPresent = true // DEVICE_BOUND actually wrote it, key present
+
+        assertFalse(storage.isPrivateKeyDecryptable(pub))
+    }
+
+    /**
+     * The disproof must NOT fire when the sibling can't open the blob: a locked
+     * auth-gated policy alias that legitimately owns its blob still reports
+     * decryptable even with an unrelated DEVICE_BOUND key present (which raises
+     * BadPadding on this policy-written blob, so it proves nothing). Guards
+     * against the b80a15c93339 fix regressing the legitimate locked-owner case.
+     */
+    @Test
+    fun lockedPolicyOwnerNotDisprovedWhenSiblingCannotOpen() = runBlocking {
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        storage.storePrivateKey(pub, secret) // policy-alias-owned blob (TAG_POLICY)
+
+        fake.throwAuthOnPolicyDecrypt = true // locked window
+        fake.deviceBoundSiblingPresent = true // sibling present but cannot open a TAG_POLICY blob
+
+        assertTrue(storage.isPrivateKeyDecryptable(pub))
+    }
+
+    /**
+     * Regression (dashpay/platform#4060, finding 1049be675782): the legacy
+     * migration must not resurrect a private key a concurrent wallet deletion
+     * just removed. [WalletStorage.retrievePrivateKey] reads and recovers the
+     * former-RSA blob WITHOUT holding the private-key mutex; a removeWallet
+     * sweep can win `withPrivateKeyExclusion` between that read and
+     * `migrateToPolicyAlias`'s rewrite, delete the alias plus its owner-index
+     * entry, and cascade the Room rows. The rewrite must then be SKIPPED — an
+     * unconditional edit recreated `privkey.<pubkeyHex>` as undiscoverable
+     * ciphertext (no owner index, no database row) behind a "successful" wipe.
+     */
+    @Test
+    fun migrationDoesNotResurrectAKeyDeletedMidRecovery() = runBlocking {
+        fake.keysAliasKind = FakeKeystoreManager.KeysAliasKind.RSA
+        fake.scheme = FakeKeystoreManager.Scheme.FORMER_RSA
+        val owner = ByteArray(32) { 4 }
+        storage.storePrivateKey(pub, secret, ownerWalletId = owner)
+
+        // The migration's policy-alias re-encrypt is the window between the
+        // caller's read and the conditional rewrite: model the concurrent
+        // deletion sweep winning it.
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        fake.onNextPolicyEncrypt = {
+            runBlocking {
+                storage.withPrivateKeyExclusion {
+                    deletePrivateKeys(listOf(pub))
+                    deleteOwnerIndex(owner)
+                }
+            }
+        }
+
+        // The caller still gets the value it legitimately recovered…
+        assertArrayEquals(secret, storage.retrievePrivateKey(pub))
+        // …but the swept entry and owner index must NOT be re-created.
+        assertFalse(storage.hasPrivateKey(pub))
+        assertTrue(storage.ownedPrivateKeyAliases(owner).isEmpty())
+        assertNull(storage.retrievePrivateKey(pub))
+    }
+
+    /**
+     * A closed auth window must NOT be mistaken for a wrong key: the
+     * UserNotAuthenticatedException propagates so KeystoreSigner can prompt,
+     * instead of being swallowed into the former-RSA fallback.
+     */
+    @Test
+    fun authFailureOnPolicyDecryptPropagates() = runBlocking {
+        fake.scheme = FakeKeystoreManager.Scheme.CURRENT
+        storage.storePrivateKey(pub, secret) // provisions the policy alias
+
+        fake.throwAuthOnPolicyDecrypt = true
+        assertThrows(UserNotAuthenticatedException::class.java) {
+            runBlocking { storage.retrievePrivateKey(pub) }
+        }
+        assertEquals(0, fake.legacyRsaFallbackCalls) // never fell through to the fallback
+    }
+
+}
+
+/**
+ * Deterministic in-memory stand-in for [KeystoreManager] used only by
+ * [WalletStorageUpgradeMatrixTest]. RSA-shaped blobs are 256-byte, empty-IV
+ * ciphertexts tagged with the producing alias; legacy AES blobs carry a
+ * non-empty IV. Only the alias that produced an RSA blob can decrypt it — every
+ * other combination raises [BadPaddingException], mirroring the JCE contract the
+ * production routing depends on. The pure structural predicates
+ * ([isLegacyKeysBlob], [isKeysBlobDecryptable]) are inherited unchanged.
+ */
+private class FakeKeystoreManager :
+    KeystoreManager(KeySecurityPolicy.AUTH_GATED) {
+
+    enum class Scheme { CURRENT, FORMER_RSA, LEGACY_AES, SIBLING_POLICY }
+
+    enum class KeysAliasKind { NONE, AES, RSA }
+
+    var scheme: Scheme = Scheme.CURRENT
+    var keysAliasKind: KeysAliasKind = KeysAliasKind.NONE
+    var policyKeyProvisioned: Boolean = false
+    var throwAuthOnPolicyDecrypt: Boolean = false
+    var throwAuthOnLegacyRsaDecrypt: Boolean = false
+    var legacyRsaFallbackCalls: Int = 0
+
+    /**
+     * One-shot hook fired at the next policy-alias encrypt — the exact
+     * window between a legacy recovery's read/decrypt and
+     * `migrateToPolicyAlias`'s rewrite, where a concurrent wallet deletion
+     * can interleave (finding 1049be675782).
+     */
+    var onNextPolicyEncrypt: (() -> Unit)? = null
+
+    /**
+     * A present, non-auth-gated DEVICE_BOUND sibling key. Modelling the JCE
+     * invariant, it opens ONLY the sibling-written blob (TAG_SIBLING) — the one
+     * alias that produced it — prompt-free.
+     */
+    var deviceBoundSiblingPresent: Boolean = false
+
+    override val keysAlias: String get() = POLICY_ALIAS
+
+    // The real implementation hashes an AndroidKeyStore public key, which
+    // cannot exist on the JVM. WalletStorage records this alongside every
+    // written blob (see storePrivateKeyEntryLocked / isCurrentKeysBlob), so
+    // pin a deterministic per-alias value.
+    override fun keysAliasFingerprint(): String = "fake-fingerprint-" + keysAlias
+
+    override fun opensUnderNonGatedDeviceBoundSibling(blob: EncryptedBlob): Boolean =
+        deviceBoundSiblingPresent && blob.ciphertext[0] == TAG_SIBLING
+
+    override fun encrypt(plaintext: ByteArray, alias: String): EncryptedBlob = when (scheme) {
+        Scheme.CURRENT -> {
+            onNextPolicyEncrypt?.let { hook ->
+                onNextPolicyEncrypt = null
+                hook()
+            }
+            policyKeyProvisioned = true // public-key encrypt provisions the alias
+            rsaBlob(TAG_POLICY, plaintext)
+        }
+        Scheme.FORMER_RSA -> rsaBlob(TAG_FORMER_RSA, plaintext) // does NOT provision policy
+        // A blob produced by a sibling policy alias: neither the current policy
+        // alias key nor the former RSA key can open it, and it does NOT provision
+        // the policy alias (dashpay/platform#4060).
+        Scheme.SIBLING_POLICY -> rsaBlob(TAG_SIBLING, plaintext)
+        Scheme.LEGACY_AES -> aesBlob(plaintext)
+    }
+
+    override fun decrypt(blob: EncryptedBlob, alias: String): ByteArray {
+        if (throwAuthOnPolicyDecrypt) throw UserNotAuthenticatedException()
+        require(alias == POLICY_ALIAS) { "test only decrypts under the policy alias" }
+        if (blob.ciphertext[0] == TAG_POLICY && policyKeyProvisioned) return plaintextOfRsa(blob)
+        throw BadPaddingException("wrong key for $alias")
+    }
+
+    override fun decryptLegacyKeysBlob(blob: EncryptedBlob): ByteArray? =
+        if (keysAliasKind == KeysAliasKind.AES) plaintextOfAes(blob) else null
+
+    override fun decryptLegacyRsaKeysBlob(blob: EncryptedBlob): ByteArray? {
+        legacyRsaFallbackCalls++
+        if (keysAliasKind != KeysAliasKind.RSA) return null
+        // Auth-gated former RSA key with a closed window throws before the padding
+        // check (parity with AndroidKeyStore), independent of blob match.
+        if (throwAuthOnLegacyRsaDecrypt) throw UserNotAuthenticatedException()
+        if (blob.ciphertext[0] == TAG_FORMER_RSA) return plaintextOfRsa(blob)
+        throw BadPaddingException("former RSA key cannot open this blob")
+    }
+
+    override fun hasLegacyKeysKey(): Boolean = keysAliasKind == KeysAliasKind.AES
+
+    override fun hasLegacyRsaKeysKey(): Boolean = keysAliasKind == KeysAliasKind.RSA
+
+    override fun hasIdentityKeysKey(alias: String): Boolean =
+        alias == POLICY_ALIAS && policyKeyProvisioned
+
+    private fun rsaBlob(tag: Byte, plain: ByteArray): EncryptedBlob {
+        val ct = ByteArray(RSA_BLOB_BYTES)
+        ct[0] = tag
+        ct[1] = plain.size.toByte()
+        plain.copyInto(ct, 2)
+        return EncryptedBlob(iv = ByteArray(0), ciphertext = ct)
+    }
+
+    private fun plaintextOfRsa(blob: EncryptedBlob): ByteArray {
+        val len = blob.ciphertext[1].toInt() and 0xFF
+        return blob.ciphertext.copyOfRange(2, 2 + len)
+    }
+
+    private fun aesBlob(plain: ByteArray): EncryptedBlob {
+        val ct = ByteArray(1 + plain.size)
+        ct[0] = plain.size.toByte()
+        plain.copyInto(ct, 1)
+        return EncryptedBlob(iv = ByteArray(12) { 0xAA.toByte() }, ciphertext = ct)
+    }
+
+    private fun plaintextOfAes(blob: EncryptedBlob): ByteArray {
+        val len = blob.ciphertext[0].toInt() and 0xFF
+        return blob.ciphertext.copyOfRange(1, 1 + len)
+    }
+
+    private companion object {
+        const val POLICY_ALIAS = KeystoreManager.KEYS_ALIAS_AUTH_GATED
+        const val RSA_BLOB_BYTES = 2048 / 8
+        const val TAG_POLICY: Byte = 0
+        const val TAG_FORMER_RSA: Byte = 2
+        const val TAG_SIBLING: Byte = 3
+    }
+}

@@ -1,6 +1,8 @@
 package org.dashfoundation.dashsdk.security
 
+import android.app.KeyguardManager
 import android.content.Context
+import android.security.keystore.UserNotAuthenticatedException
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
@@ -10,6 +12,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.security.GeneralSecurityException
 import java.util.Base64
 
 private val Context.secretsStore: DataStore<Preferences> by preferencesDataStore(
@@ -25,20 +28,41 @@ private val Context.secretsStore: DataStore<Preferences> by preferencesDataStore
  * keys, stored base64 in a dedicated Preferences DataStore.
  * Key layout mirrors the iOS account naming:
  * - `mnemonic.<walletIdHex>` — wallet mnemonics (master alias, AES-GCM)
- * - `privkey.<pubkeyHex>` — identity private keys (keys alias: RSA
- *   public-key encrypt / auth-gated private-key decrypt)
+ * - `privkey.<pubkeyHex>` — identity private keys (the [keystore]'s
+ *   [KeystoreManager.keysAlias]: RSA public-key encrypt / private-key
+ *   decrypt that is auth-gated or not per the keystore's
+ *   [KeySecurityPolicy])
  *
  * Consuming apps should exclude this DataStore from Android's default app-data
  * backup — Keystore keys are device-bound and never restored, so a backed-up
  * blob can never be decrypted on the new device. See
  * `res/xml/dash_sdk_backup_rules.xml` and `res/xml/dash_sdk_data_extraction_rules.xml`
  * for ready-made exclusion rules and the manifest snippet to reference them.
+ *
+ * The identity-key security policy is fixed by the [keystore] this storage
+ * wraps; use the policy-taking constructor to opt into
+ * [KeySecurityPolicy.DEVICE_BOUND] (see [KeySecurityPolicy] for the
+ * semantics and the stability requirement). The default is the historical
+ * [KeySecurityPolicy.AUTH_GATED] behavior, unchanged.
  */
 class WalletStorage(
     context: Context,
-    private val keystore: KeystoreManager = KeystoreManager(),
+    private val keystore: KeystoreManager =
+        KeystoreManager(deviceSecureProbe = deviceSecureProbe(context)),
 ) {
+    /**
+     * Construct with an explicit identity-key [keySecurityPolicy] —
+     * convenience for host apps that don't otherwise need to touch
+     * [KeystoreManager]. `WalletStorage(context)` keeps the
+     * [KeySecurityPolicy.AUTH_GATED] default.
+     */
+    constructor(context: Context, keySecurityPolicy: KeySecurityPolicy) :
+        this(context, KeystoreManager(keySecurityPolicy, deviceSecureProbe(context)))
+
     private val store = context.secretsStore
+
+    /** The identity-key security policy this storage was constructed with. */
+    val keySecurityPolicy: KeySecurityPolicy get() = keystore.keySecurityPolicy
 
     /**
      * Serializes every `privkey.*` alias mutation. A single DataStore
@@ -208,14 +232,15 @@ class WalletStorage(
 
     /**
      * Store raw private-key bytes for [pubkeyHex], encrypted with the
-     * [KeystoreManager.KEYS_ALIAS] RSA public key. Public-key encrypt is
-     * never auth-gated, so this never prompts and never throws
-     * `UserNotAuthenticatedException` — matching iOS's silent identity-key
-     * write, and letting the persistence callback (which runs on a Rust
-     * Tokio thread under the wallet-manager write lock, where a prompt is
-     * impossible) store keys. Per the CLAUDE.md doctrine this is the one
-     * allowed Kotlin-side persistence of key material: Rust derives, we
-     * encrypt. Reads ([retrievePrivateKey]) still require auth.
+     * [KeystoreManager.keysAlias] RSA public key. Public-key encrypt is
+     * never auth-gated (under either [KeySecurityPolicy]), so this never
+     * prompts and never throws `UserNotAuthenticatedException` — matching
+     * iOS's silent identity-key write, and letting the persistence callback
+     * (which runs on a Rust Tokio thread under the wallet-manager write
+     * lock, where a prompt is impossible) store keys. Per the CLAUDE.md
+     * doctrine this is the one allowed Kotlin-side persistence of key
+     * material: Rust derives, we encrypt. Reads ([retrievePrivateKey])
+     * require auth only under [KeySecurityPolicy.AUTH_GATED].
      */
     /**
      * @param ownerWalletId when given, the alias is also recorded in the
@@ -364,7 +389,7 @@ class WalletStorage(
         privateKey: ByteArray,
         ownerWalletId: ByteArray?,
     ) {
-        val blob = keystore.encrypt(privateKey, alias = KeystoreManager.KEYS_ALIAS)
+        val blob = keystore.encrypt(privateKey, alias = keystore.keysAlias)
         store.edit {
             it[privateKeyKey(pubkeyHex)] = encode(blob)
             it[privateKeyFingerprintKey(pubkeyHex)] = keystore.keysAliasFingerprint()
@@ -377,7 +402,7 @@ class WalletStorage(
 
     /**
      * Whether the stored blob for [pubkeyHex] is both structurally an RSA
-     * blob and was encrypted under the [KeystoreManager.KEYS_ALIAS] keypair
+     * blob and was encrypted under the [KeystoreManager.keysAlias] keypair
      * currently in the Keystore — see [KeystoreManager.keysAliasFingerprint].
      * A missing fingerprint (written before this check existed) is treated
      * as unusable rather than trusted, since a stale RSA-shaped blob is
@@ -403,14 +428,138 @@ class WalletStorage(
         store.data.first()[ownerIndexKey(walletId.toHex())] ?: emptySet()
 
     /**
-     * Decrypt the private key for [pubkeyHex]. Throws
+     * Decrypt the private key for [pubkeyHex]. Under
+     * [KeySecurityPolicy.AUTH_GATED] this throws
      * `UserNotAuthenticatedException` when the auth window expired — the
-     * caller (KeystoreSigner) routes through [BiometricGate] and retries.
+     * caller (KeystoreSigner) routes through [BiometricGate] and retries;
+     * under [KeySecurityPolicy.DEVICE_BOUND] it never auth-gates.
      * Callers must zero the returned array after use.
+     *
+     * Upgrade path — two legacy on-disk schemes are recovered and migrated
+     * forward transparently (so old identity keys are never stranded), then
+     * future reads use the current aliased RSA scheme:
+     *  1. **Pre-RSA AES-GCM** blob (non-empty IV) under the legacy
+     *     [KeystoreManager.KEYS_ALIAS] AES key — decrypted with that retained
+     *     key ([KeystoreManager.decryptLegacyKeysBlob]).
+     *  2. **Pre-alias-split RSA** blob (empty IV) encrypted under the former RSA
+     *     keypair still at [KeystoreManager.KEYS_ALIAS] — the current policy
+     *     alias cannot open it, so we fall back to that keypair
+     *     ([KeystoreManager.decryptLegacyRsaKeysBlob]) (dashpay/platform#4060).
+     * Both are re-encrypted under [KeystoreManager.keysAlias] and rewritten. A
+     * fresh install has no legacy blobs and always takes the current-alias path.
      */
     suspend fun retrievePrivateKey(pubkeyHex: String): ByteArray? {
         val encoded = store.data.first()[privateKeyKey(pubkeyHex)] ?: return null
-        return keystore.decrypt(decode(encoded), alias = KeystoreManager.KEYS_ALIAS)
+        val blob = decode(encoded)
+        if (keystore.isLegacyKeysBlob(blob)) {
+            // Scheme 1 — legacy AES-GCM blob: recover with the retained legacy
+            // AES key (may throw UserNotAuthenticatedException — the legacy key
+            // was auth-gated — which the signer handles exactly as the RSA
+            // path), or null if that key is already gone (unrecoverable).
+            val plain = keystore.decryptLegacyKeysBlob(blob) ?: return null
+            migrateToPolicyAlias(pubkeyHex, plain, encoded)
+            return plain
+        }
+        // Empty-IV RSA blob: encrypted under the current policy alias (steady
+        // state), the former RSA keypair still at KEYS_ALIAS (scheme 2 blobs
+        // written before the alias split), or — after a policy switch (e.g.
+        // AUTH_GATED→DEVICE_BOUND) — a *sibling* policy alias we no longer target
+        // (dashpay/platform#4060). Key *presence* never proves which alias wrote
+        // THIS blob: an unrelated former RSA key can linger next to a
+        // sibling-alias blob, so every candidate key is TRIED and a wrong-key
+        // crypto failure is treated as "not this key" (per the
+        // [KeystoreManager.decryptLegacyRsaKeysBlob] contract) rather than letting
+        // a BadPaddingException escape uncaught into KeystoreSigner. A blob that no
+        // present key can open is unrecoverable → null (key-health then offers a
+        // re-derive), mirroring the legacy-AES stranded path above — never a bogus
+        // plaintext. UserNotAuthenticatedException is NOT a wrong-key signal and
+        // always propagates so KeystoreSigner can prompt and retry.
+
+        // Upgrade fast path: an unprovisioned policy alias cannot have produced
+        // the blob, so recover with the former RSA keypair directly instead of
+        // provisioning a throwaway policy keypair only to fail. If that key does
+        // not open it either (former key absent, or the blob belongs to a sibling
+        // alias), the blob is unrecoverable here → null.
+        if (!keystore.hasIdentityKeysKey(keystore.keysAlias)) {
+            val recovered = tryFormerRsaRecovery(blob) ?: return null
+            migrateToPolicyAlias(pubkeyHex, recovered, encoded)
+            return recovered
+        }
+        // Steady state: try the current policy alias first; on a wrong-key crypto
+        // failure (a scheme-2 / sibling blob lingering while a key already lives at
+        // the policy alias) fall back to the former RSA keypair and migrate, else
+        // report the blob unrecoverable (null).
+        return try {
+            keystore.decrypt(blob, alias = keystore.keysAlias)
+        } catch (e: UserNotAuthenticatedException) {
+            throw e
+        } catch (e: GeneralSecurityException) {
+            val recovered = tryFormerRsaRecovery(blob) ?: return null
+            migrateToPolicyAlias(pubkeyHex, recovered, encoded)
+            recovered
+        }
+    }
+
+    /**
+     * Attempt recovery of an empty-IV RSA blob with the retained former
+     * pre-alias-split RSA keypair at [KeystoreManager.KEYS_ALIAS], converting a
+     * wrong-key crypto failure to `null` ("not this key",
+     * dashpay/platform#4060). [KeystoreManager.decryptLegacyRsaKeysBlob] returns
+     * `null` when that key is absent and throws a JCE `BadPaddingException` when
+     * the key is present but did not write the blob — presence alone is not proof
+     * of origin, so that throw must be absorbed here rather than escaping
+     * uncaught. `UserNotAuthenticatedException` is a closed-auth-window signal,
+     * never a wrong key, so it propagates unchanged.
+     */
+    private fun tryFormerRsaRecovery(blob: KeystoreManager.EncryptedBlob): ByteArray? =
+        try {
+            keystore.decryptLegacyRsaKeysBlob(blob)
+        } catch (e: UserNotAuthenticatedException) {
+            throw e
+        } catch (e: GeneralSecurityException) {
+            null
+        }
+
+    /**
+     * Best-effort re-encrypt [plain] under the current policy alias
+     * ([KeystoreManager.keysAlias], a never-auth-gated public-key encrypt) and
+     * rewrite the stored blob, migrating a recovered legacy value forward. A
+     * rewrite failure must not lose the value the caller just recovered, so this
+     * stays best-effort (migration retries on the next read).
+     *
+     * The rewrite is CONDITIONAL on the entry still holding [sourceEncoded] —
+     * the exact encoded blob the caller read and recovered. [retrievePrivateKey]
+     * runs without [privateKeyMutex], so between its read and this rewrite a
+     * wallet deletion can win [withPrivateKeyExclusion], sweep the alias plus
+     * its owner-index entry, and cascade the Room rows; an unconditional edit
+     * would then RESURRECT `privkey.<pubkeyHex>` as undiscoverable ciphertext
+     * with no owner-index or database reference, violating removeWallet's
+     * no-surviving-ciphertext guarantee (dashpay/platform#4060, finding
+     * 1049be675782). DataStore serializes edits, so the still-present check and
+     * the write commit atomically against the deletion's edit: if the deletion
+     * (or any concurrent overwrite — e.g. a [storePrivateKey] racing in a newer
+     * value) got there first, the migration is skipped; the caller still
+     * returns the plaintext it legitimately recovered.
+     */
+    private suspend fun migrateToPolicyAlias(
+        pubkeyHex: String,
+        plain: ByteArray,
+        sourceEncoded: String,
+    ) {
+        runCatching {
+            val migrated = keystore.encrypt(plain, alias = keystore.keysAlias)
+            store.edit {
+                val key = privateKeyKey(pubkeyHex)
+                if (it[key] == sourceEncoded) {
+                    it[key] = encode(migrated)
+                    // Keep the write-time fingerprint coherent with the
+                    // re-encrypted blob, so [isCurrentKeysBlob] (the
+                    // storeIfAbsent usability check) recognizes the migrated
+                    // entry instead of re-deriving it.
+                    it[privateKeyFingerprintKey(pubkeyHex)] = keystore.keysAliasFingerprint()
+                }
+            }
+        }
     }
 
     suspend fun deletePrivateKey(pubkeyHex: String) {
@@ -461,18 +610,89 @@ class WalletStorage(
         store.data.first().contains(privateKeyKey(pubkeyHex))
 
     /**
-     * Whether the blob stored for [pubkeyHex] is decryptable under the
-     * current [KeystoreManager.KEYS_ALIAS] RSA scheme. Blobs written by the
-     * pre-RSA AES-GCM scheme survive in the DataStore but lost their key
-     * when the RSA pair replaced it, so signing with them can only fail —
-     * key-health treats them as missing and offers a re-derive. Structural
-     * check only: never decrypts, never prompts.
+     * Whether the blob stored for [pubkeyHex] can actually be recovered. This
+     * PROBES the same candidate keys [retrievePrivateKey] would use and returns
+     * true only when a present key actually opens the blob — NOT a bare
+     * key-presence check, which reported a stranded/sibling-alias blob "healthy"
+     * merely because an unrelated key of the right shape existed
+     * (dashpay/platform#4060, finding e17e265dc680), so `WalletKeyHealthSheet`
+     * never offered the re-derive/repair path this check exists to drive.
+     *
+     * The probe never prompts: [KeystoreManager.decrypt] /
+     * [KeystoreManager.decryptLegacyRsaKeysBlob] / [KeystoreManager.decryptLegacyKeysBlob]
+     * are bare Cipher operations — the biometric prompt is driven only by
+     * `KeystoreSigner`/`BiometricGate`, never here. An auth-gated key whose auth
+     * window is closed therefore throws `UserNotAuthenticatedException` (rather
+     * than showing UI), which counts as DECRYPTABLE: the key is present and the
+     * value would recover after the user authenticates, so a health check must not
+     * report it strandable. Only a wrong-key crypto failure (BadPadding / AEAD tag)
+     * or an absent key yields "not decryptable". Recovered plaintext is scrubbed
+     * immediately — a health check must not leave key bytes on the heap.
+     *
+     *  - **Legacy AES-GCM** blob (non-empty IV): probe [KeystoreManager.decryptLegacyKeysBlob].
+     *  - **Empty-IV RSA** blob: first let a prompt-free DEVICE_BOUND sibling
+     *    DISPROVE ownership (see below), then probe the current policy alias
+     *    (only if provisioned — an unprovisioned alias can't have written it),
+     *    then the retained former KEYS_ALIAS RSA keypair. A structurally non-RSA
+     *    blob is not decryptable.
+     *
+     * **AUTH_GATED residual (dashpay/platform#4060, finding b80a15c93339).** A
+     * locked auth-gated alias throws `UserNotAuthenticatedException` at
+     * `cipher.init` — before the ciphertext is examined — so a bare catch cannot
+     * tell a locked *legitimate owner* from a locked *wrong* alias, and would
+     * mis-report a sibling-written blob as decryptable. The prompt-free
+     * DEVICE_BOUND sibling ([KeystoreManager.opensUnderNonGatedDeviceBoundSibling])
+     * resolves the common case: if that non-gated sibling opens the blob, the
+     * current (auth-gated) policy alias does NOT own it, and since
+     * [retrievePrivateKey] never falls back to the sibling the blob is genuinely
+     * strandable → `false` (drives the re-derive/repair path). The irreducible
+     * residual is the symmetric one — a locked auth-gated FORMER RSA key at
+     * KEYS_ALIAS whose ownership can't be disproved prompt-free: it is still
+     * reported decryptable until the first real unlock surfaces the BadPadding,
+     * at which point [retrievePrivateKey]'s fallback→null drives the same repair.
      */
     suspend fun isPrivateKeyDecryptable(pubkeyHex: String): Boolean {
-        val prefs = store.data.first()
-        val encoded = prefs[privateKeyKey(pubkeyHex)] ?: return false
-        return isCurrentKeysBlob(pubkeyHex, encoded, prefs)
+        val encoded = store.data.first()[privateKeyKey(pubkeyHex)] ?: return false
+        val blob = decode(encoded)
+        return when {
+            keystore.isLegacyKeysBlob(blob) ->
+                probeOpensBlob { keystore.decryptLegacyKeysBlob(blob) }
+            !keystore.isKeysBlobDecryptable(blob) -> false
+            // A prompt-free sibling proves the blob belongs to the non-gated
+            // DEVICE_BOUND alias, not the current (auth-gated, possibly locked)
+            // policy alias — and retrieve never tries the sibling — so it is
+            // unrecoverable here (finding b80a15c93339).
+            keystore.opensUnderNonGatedDeviceBoundSibling(blob) -> false
+            else ->
+                (keystore.hasIdentityKeysKey(keystore.keysAlias) &&
+                    probeOpensBlob { keystore.decrypt(blob, keystore.keysAlias) }) ||
+                    (keystore.hasLegacyRsaKeysKey() &&
+                        probeOpensBlob { keystore.decryptLegacyRsaKeysBlob(blob) })
+        }
     }
+
+    /**
+     * True iff [decrypt] recovers [blob] with a PRESENT key (plaintext scrubbed
+     * immediately), or the key is auth-gated with a closed window
+     * (`UserNotAuthenticatedException` — present and would recover after auth, so
+     * decryptable). A wrong-key crypto failure or an absent key (`null`) is false.
+     * Prompt-free by construction — see [isPrivateKeyDecryptable]. Used only by the
+     * non-prompting key-health probe, never on a signing path.
+     */
+    private fun probeOpensBlob(decrypt: () -> ByteArray?): Boolean =
+        try {
+            val plain = decrypt()
+            if (plain != null) {
+                plain.fill(0)
+                true
+            } else {
+                false
+            }
+        } catch (e: UserNotAuthenticatedException) {
+            true
+        } catch (e: GeneralSecurityException) {
+            false
+        }
 
     /** All entry names (masked listing for the Keystore Explorer screen). */
     suspend fun listEntryNames(): List<String> =
@@ -515,5 +735,22 @@ class WalletStorage(
         const val PRIVKEY_OWNERS_PREFIX = "privkeyowners."
 
         fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+        /**
+         * A prompt-free probe of whether the device currently has a secure lock
+         * screen (`KeyguardManager.isDeviceSecure`), captured against the
+         * application context so it re-reads live state at each key generation
+         * (a lock can be added/removed at any time). Handed to [KeystoreManager]
+         * so it can drop the lock-screen-bound key-gen parameters when no lock is
+         * configured — the wallet must work without a screen lock
+         * (dashpay/platform#4060).
+         */
+        fun deviceSecureProbe(context: Context): () -> Boolean {
+            val appContext = context.applicationContext
+            return {
+                (appContext.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)
+                    ?.isDeviceSecure == true
+            }
+        }
     }
 }
